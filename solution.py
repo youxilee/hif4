@@ -108,6 +108,18 @@ _RATIO_MIN = 0.10
 _WEIGHT_QUADRATIC = True
 _WEIGHT_QUADRATIC_MAX_FEATURES = 4096
 
+# Dynamic activation quantization can also use the full weight Gram (W^T W)
+# as quadratic error weights.  Unlike Q/K covariances (estimated from a few
+# calibration tokens), the weight Gram is static and well conditioned, so the
+# same machinery that helped weight quantization should transfer.  Only the
+# per-4-group 4x4 blocks are stored in the state (~4*channels elements).
+_ACTIVATION_QUADRATIC = True
+# Gram state is ~4*channels elements; cap so the single stored tensor stays
+# within 4096 elements even under a strict element-count reading of the state
+# node limit.  Wide layers (e.g. FFN down-projection, 3072) fall back to the
+# diagonal importance automatically.
+_ACTIVATION_QUADRATIC_MAX_FEATURES = 1024
+
 
 def dequantize_nvfp4(
     quant_float: torch.Tensor,
@@ -257,6 +269,18 @@ def _loss_capture_ratio(
     return float(
         min(1.0, max(float(ratio_min), k / max(1, int(losses.numel()))))
     )
+
+
+def _flat_group_gram(cov: torch.Tensor, channels: int) -> torch.Tensor:
+    """Extract per-4-group 4x4 block-diagonal quadratic weights as a flat
+    ``[channels // 4, 4, 4]`` tensor (the only part the solver needs)."""
+
+    blocks = channels // _HIF4_BLOCK_SIZE
+    g = cov.reshape(blocks, 64, blocks, 64)
+    g = torch.diagonal(g, dim1=0, dim2=2).permute(2, 0, 1)
+    g = g.reshape(blocks, 16, 4, 16, 4)
+    g = torch.diagonal(g, dim1=1, dim2=3).permute(0, 3, 1, 2)
+    return g.reshape(blocks * 16, 4, 4)
 
 
 def _identity_permutation(length: int, device: torch.device) -> torch.Tensor:
@@ -820,6 +844,7 @@ def _nvfp4_to_hif4(
     center_num_heads: Optional[int] = None,
     center_head_dim: Optional[int] = None,
     importance: Optional[torch.Tensor] = None,
+    group_gram: Optional[torch.Tensor] = None,
     search_offsets: Optional[Union[Sequence[int], torch.Tensor]] = None,
     error_threshold: float = 0.0,
     accept_margin: float = 0.0,
@@ -847,9 +872,25 @@ def _nvfp4_to_hif4(
         if int(order.numel()) != channels:
             raise ValueError("Permutation width does not match tensor width")
         dense = dense.index_select(-1, order)
+    gram = None
+    if group_gram is not None:
+        gram = group_gram.detach().to(
+            device=dense.device, dtype=torch.float32
+        )
+        expected = (channels // 4, 4, 4)
+        if tuple(gram.shape) != expected:
+            raise ValueError(
+                f"group_gram shape {tuple(gram.shape)} does not match "
+                f"expected {expected}"
+            )
+        blocks = channels // _HIF4_BLOCK_SIZE
+        gram = gram.reshape(blocks, 8, 2, 4, 4).unsqueeze(0).expand(
+            int(dense.shape[0]), blocks, 8, 2, 4, 4
+        )
     return _dense_to_hif4(
         dense,
         importance=importance,
+        group_gram=gram,
         search_offsets=search_offsets,
         error_threshold=error_threshold,
         accept_margin=accept_margin,
@@ -1076,12 +1117,9 @@ def hif4_calibration_and_quantize_weight(
         gram = gram / d.unsqueeze(0) / d.unsqueeze(1)
         gram = gram.index_select(0, best_perm).index_select(1, best_perm)
         blocks = in_features // _HIF4_BLOCK_SIZE
-        g = gram.reshape(blocks, 64, blocks, 64)
-        g = torch.diagonal(g, dim1=0, dim2=2).permute(2, 0, 1)
-        g = g.reshape(blocks, 16, 4, 16, 4)
-        g = torch.diagonal(g, dim1=1, dim2=3).permute(0, 3, 1, 2)
-        g = g.reshape(blocks, 8, 2, 4, 4)
-        weight_group_gram = g.unsqueeze(0).expand(
+        weight_group_gram = _flat_group_gram(gram, in_features).reshape(
+            blocks, 8, 2, 4, 4
+        ).unsqueeze(0).expand(
             int(weight.shape[0]), blocks, 8, 2, 4, 4
         )
     weight_params = _dense_to_hif4(
@@ -1134,10 +1172,21 @@ def hif4_calibration_and_quantize_weight(
     else:
         activation_ratio = _ACTIVATION_REFINE_MAX_RATIO
 
+    activation_gram_state = None
+    if (
+        _ACTIVATION_QUADRATIC
+        and in_features <= _ACTIVATION_QUADRATIC_MAX_FEATURES
+    ):
+        gram = weight_smooth.t().mm(weight_smooth)
+        activation_gram_state = _cpu_state_tensor(
+            _flat_group_gram(gram, in_features)
+        )
+
     activation_state = {
         "smooth_inv": smooth_inv_state,
         "permutation": permutation_state,
         "importance": _cpu_state_tensor(activation_importance),
+        "gram": activation_gram_state,
         "offsets": torch.tensor(_DYNAMIC_OFFSETS, dtype=torch.int8, device="cpu"),
         "error_threshold": _ACTIVATION_REFINE_ERROR_THRESHOLD,
         "accept_margin": _ACTIVATION_REFINE_ACCEPT_MARGIN,
@@ -1169,6 +1218,7 @@ def hif4_dynamic_quantize_activation(
         multiplier=activation_state["smooth_inv"],
         permutation=activation_state["permutation"],
         importance=activation_state["importance"],
+        group_gram=activation_state.get("gram"),
         search_offsets=activation_state["offsets"],
         error_threshold=float(activation_state["error_threshold"]),
         accept_margin=float(activation_state["accept_margin"]),
