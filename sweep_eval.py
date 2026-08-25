@@ -50,6 +50,7 @@ def make_configs() -> list[tuple[str, dict]]:
         "_DATA_DRIVEN_RATIO": True,
         "_RATIO_CAPTURE_TARGET": 0.99,
         "_WEIGHT_QUADRATIC": True,
+        "_ATTN_QUADRATIC": False,
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
         "_Q_REFINE_MAX_RATIO": 0.60,
         "_K_REFINE_MAX_RATIO": 0.70,
@@ -66,6 +67,13 @@ def make_configs() -> list[tuple[str, dict]]:
         ("best", best),                      # 当前最佳版本（基准）
         ("old", old),                      # 代码改动前的行为
         ("no_quad", {**best, "_WEIGHT_QUADRATIC": False}),
+        ("no_attn_quad", {**best, "_ATTN_QUADRATIC": False}),
+        ("attn_shrink05", {**best,
+                           "_ATTN_QUADRATIC": True,
+                           "_ATTN_QUADRATIC_SHRINK": 0.5}),
+        ("attn_shrink08", {**best,
+                           "_ATTN_QUADRATIC": True,
+                           "_ATTN_QUADRATIC_SHRINK": 0.8}),
     ]
 
 
@@ -96,6 +104,7 @@ def apply_config(overrides: dict) -> None:
         "_REFINE_EDGE_EXTEND_STEPS": 2,
         "_DATA_DRIVEN_RATIO": False,
         "_WEIGHT_QUADRATIC": False,
+        "_ATTN_QUADRATIC": False,
         "_RATIO_CAPTURE_TARGET": 0.95,
         "_RATIO_MIN": 0.10,
         "_RATIO_MAX": 1.0,

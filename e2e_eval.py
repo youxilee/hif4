@@ -321,6 +321,7 @@ def set_config(name: str, real_normalize) -> None:
         s._DATA_DRIVEN_RATIO = False
         s._OFFSET_SELECTION = False
         s._WEIGHT_QUADRATIC = False
+        s._ATTN_QUADRATIC = False
         s._ATTN_CENTER_MODES = (0, 2)
         s._normalize_importance = _normalize_no_floor
     else:
@@ -340,6 +341,7 @@ def set_config(name: str, real_normalize) -> None:
         s._DATA_DRIVEN_RATIO = True
         s._OFFSET_SELECTION = False
         s._WEIGHT_QUADRATIC = True
+        s._ATTN_QUADRATIC = False
         s._ATTN_CENTER_MODES = (0, 2)
         s._normalize_importance = real_normalize
 

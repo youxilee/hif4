@@ -119,6 +119,14 @@ _RATIO_MAX = 1.0
 _WEIGHT_QUADRATIC = True
 _WEIGHT_QUADRATIC_MAX_FEATURES = 4096
 
+# Same quadratic (full-covariance) idea for dynamic Q/K quantization: Q error
+# is weighted by the transformed K covariance, K error by the transformed Q
+# covariance.  Only the per-4-group 4x4 blocks are stored in the state
+# (a single tensor node, ~4*channels elements), so the 4096-node state limit
+# is respected under either "tensor = 1 node" or "element = node" counting.
+_ATTN_QUADRATIC = False
+_ATTN_QUADRATIC_SHRINK = 0.5  # 1.0=满协方差, 0.0=对角重要性
+
 
 def dequantize_nvfp4(
     quant_float: torch.Tensor,
@@ -268,6 +276,37 @@ def _loss_capture_ratio(
     return float(
         min(1.0, max(float(ratio_min), k / max(1, int(losses.numel()))))
     )
+
+
+def _transform_covariance(
+    cov: torch.Tensor,
+    multiplier: torch.Tensor,
+    permutation: torch.Tensor,
+) -> torch.Tensor:
+    """Align a channel covariance with the dynamic transform:
+    ``cov' = P^T D cov D P``."""
+
+    d = multiplier.detach().to(device=cov.device, dtype=cov.dtype).reshape(-1)
+    transformed = cov / d.unsqueeze(0) / d.unsqueeze(1)
+    order = permutation.detach().to(
+        device=cov.device, dtype=torch.int64
+    ).reshape(-1)
+    return transformed.index_select(0, order).index_select(1, order)
+
+
+def _covariance_group_gram(
+    cov: torch.Tensor,
+    channels: int,
+) -> torch.Tensor:
+    """Extract the per-4-group 4x4 block-diagonal quadratic weights as a flat
+    ``[channels // 4, 4, 4]`` tensor (the only part the solver needs)."""
+
+    blocks = channels // _HIF4_BLOCK_SIZE
+    g = cov.reshape(blocks, 64, blocks, 64)
+    g = torch.diagonal(g, dim1=0, dim2=2).permute(2, 0, 1)
+    g = g.reshape(blocks, 16, 4, 16, 4)
+    g = torch.diagonal(g, dim1=1, dim2=3).permute(0, 3, 1, 2)
+    return g.reshape(blocks * 16, 4, 4)
 
 
 def _identity_permutation(length: int, device: torch.device) -> torch.Tensor:
@@ -987,6 +1026,7 @@ def _nvfp4_to_hif4(
     center_num_heads: Optional[int] = None,
     center_head_dim: Optional[int] = None,
     importance: Optional[torch.Tensor] = None,
+    group_gram: Optional[torch.Tensor] = None,
     search_offsets: Optional[Union[Sequence[int], torch.Tensor]] = None,
     error_threshold: float = 0.0,
     accept_margin: float = 0.0,
@@ -1014,9 +1054,27 @@ def _nvfp4_to_hif4(
         if int(order.numel()) != channels:
             raise ValueError("Permutation width does not match tensor width")
         dense = dense.index_select(-1, order)
+    gram = None
+    if group_gram is not None:
+        gram = group_gram.detach().to(
+            device=dense.device, dtype=torch.float32
+        )
+        expected = (channels // 4, 4, 4)
+        if tuple(gram.shape) != expected:
+            raise ValueError(
+                f"group_gram shape {tuple(gram.shape)} does not match "
+                f"expected {expected}"
+            )
+        blocks = channels // _HIF4_BLOCK_SIZE
+        gram = gram.reshape(blocks, 16, 4, 4).reshape(
+            blocks, 8, 2, 4, 4
+        ).unsqueeze(0).expand(
+            int(dense.shape[0]), blocks, 8, 2, 4, 4
+        )
     return _dense_to_hif4(
         dense,
         importance=importance,
+        group_gram=gram,
         search_offsets=search_offsets,
         error_threshold=error_threshold,
         accept_margin=accept_margin,
@@ -1480,6 +1538,13 @@ def hif4_calibration_attention(
     q_samples: list[torch.Tensor] = []
     k_samples: list[torch.Tensor] = []
     v_samples: list[torch.Tensor] = []
+    if _ATTN_QUADRATIC:
+        q_cov_sum = torch.zeros(
+            q_channels, q_channels, dtype=torch.float32
+        )
+        k_cov_sum = torch.zeros(
+            kv_channels, kv_channels, dtype=torch.float32
+        )
 
     for sample in calib_qkv_list:
         if not isinstance(sample, dict) or set(sample.keys()) != {"q", "k", "v"}:
@@ -1509,6 +1574,17 @@ def hif4_calibration_attention(
         k_stats = _sample_rows(k, _ATTN_STATS_TOKENS).reshape(
             -1, kv_num_heads, head_dim
         )
+        if _ATTN_QUADRATIC:
+            q_cov_sum += (
+                q_stats.reshape(-1, q_channels).t().mm(
+                    q_stats.reshape(-1, q_channels)
+                )
+            )
+            k_cov_sum += (
+                k_stats.reshape(-1, kv_channels).t().mm(
+                    k_stats.reshape(-1, kv_channels)
+                )
+            )
         k_mid_stats = _center_attention_k(
             k_stats.reshape(-1, kv_channels),
             kv_num_heads,
@@ -1689,6 +1765,54 @@ def hif4_calibration_attention(
     q_flat = d_q.reshape(-1)
     k_flat = d_k.reshape(-1)
 
+    if _ATTN_QUADRATIC:
+        k_gram_full = _covariance_group_gram(
+            _transform_covariance(
+                k_cov_sum / float(max(k_token_count, 1)),
+                k_flat,
+                best_k_perm,
+            ),
+            kv_channels,
+        )
+        q_gram_full = _covariance_group_gram(
+            _transform_covariance(
+                q_cov_sum / float(max(q_token_count, 1)),
+                q_flat,
+                best_q_perm,
+            ),
+            q_channels,
+        )
+        if _ATTN_QUADRATIC_SHRINK < 1.0:
+            def shrink(g: torch.Tensor) -> torch.Tensor:
+                diag_part = torch.diag_embed(
+                    torch.diagonal(g, dim1=-2, dim2=-1)
+                )
+                return (
+                    _ATTN_QUADRATIC_SHRINK * g
+                    + (1.0 - _ATTN_QUADRATIC_SHRINK) * diag_part
+                )
+
+            k_gram_full = shrink(k_gram_full)
+            q_gram_full = shrink(q_gram_full)
+        # GQA alignment: the K covariance shared by a KV head must be repeated
+        # across its group of Q heads, and the Q covariance averaged per group.
+        k_per_head = k_gram_full.reshape(
+            kv_num_heads, head_dim // 4, 4, 4
+        ).repeat_interleave(group_size, dim=0).reshape(q_channels // 4, 4, 4)
+        q_per_head = q_gram_full.reshape(
+            q_num_heads, head_dim // 4, 4, 4
+        ).reshape(kv_num_heads, group_size, head_dim // 4, 4, 4)
+        q_per_head = q_per_head.mean(dim=1).reshape(kv_channels // 4, 4, 4)
+        q_gram_state = _cpu_state_tensor(
+            k_per_head
+        )
+        k_gram_state = _cpu_state_tensor(
+            q_per_head
+        )
+    else:
+        q_gram_state = None
+        k_gram_state = None
+
     def q_transform(sample: torch.Tensor) -> torch.Tensor:
         return (sample * q_flat.reshape(1, -1)).index_select(-1, best_q_perm)
 
@@ -1775,6 +1899,7 @@ def hif4_calibration_attention(
         "multiplier": q_multiplier_state,
         "permutation": q_permutation_state,
         "importance": _cpu_state_tensor(h_k_for_q),
+        "gram": q_gram_state,
         "offsets": torch.tensor(q_offsets, dtype=torch.int8, device="cpu"),
         "error_threshold": _ATTN_REFINE_ERROR_THRESHOLD,
         "accept_margin": _Q_REFINE_ACCEPT_MARGIN,
@@ -1789,6 +1914,7 @@ def hif4_calibration_attention(
         "permutation": k_permutation_state,
         "center_mode": int(best_center_mode),
         "importance": _cpu_state_tensor(h_q_for_k),
+        "gram": k_gram_state,
         "offsets": torch.tensor(k_offsets, dtype=torch.int8, device="cpu"),
         "error_threshold": _ATTN_REFINE_ERROR_THRESHOLD,
         "accept_margin": _K_REFINE_ACCEPT_MARGIN,
@@ -1843,6 +1969,7 @@ def hif4_dynamic_quantize_q(
         multiplier=state["multiplier"],
         permutation=state["permutation"],
         importance=state["importance"],
+        group_gram=state.get("gram"),
         search_offsets=state["offsets"],
         error_threshold=float(state["error_threshold"]),
         accept_margin=float(state["accept_margin"]),
@@ -1871,6 +1998,7 @@ def hif4_dynamic_quantize_k(
         center_num_heads=kv_num_heads,
         center_head_dim=head_dim,
         importance=state["importance"],
+        group_gram=state.get("gram"),
         search_offsets=state["offsets"],
         error_threshold=float(state["error_threshold"]),
         accept_margin=float(state["accept_margin"]),
