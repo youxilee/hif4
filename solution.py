@@ -112,6 +112,13 @@ _RATIO_CAPTURE_TARGET = 0.99
 _RATIO_MIN = 0.10
 _RATIO_MAX = 1.0
 
+# Weight quantization can use the full per-block activation covariance as a
+# quadratic loss (true output-MSE weighting) instead of the diagonal
+# per-channel importance.  This is calibration-only: the Gram/covariance
+# never enters a dynamic state, so the 4096-node state limit is unaffected.
+_WEIGHT_QUADRATIC = True
+_WEIGHT_QUADRATIC_MAX_FEATURES = 4096
+
 
 def dequantize_nvfp4(
     quant_float: torch.Tensor,
@@ -593,6 +600,8 @@ def _solve_exact_hierarchy(
     x_abs: torch.Tensor,
     scale: torch.Tensor,
     importance: Optional[torch.Tensor],
+    sign: Optional[torch.Tensor] = None,
+    group_gram: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exactly solve lv2/lv3 for fixed scales using three loss tables.
 
@@ -600,6 +609,10 @@ def _solve_exact_hierarchy(
         x_abs: ``[num_blocks, 8, 2, 4]`` absolute values.
         scale: ``[num_blocks]`` finite E6M2 values.
         importance: optional tensor with the same shape as ``x_abs``.
+        sign: ``[num_blocks, 8, 2, 4]`` signs (required with ``group_gram``).
+        group_gram: ``[num_blocks, 8, 2, 4, 4]`` per-group quadratic weights;
+            when given, the loss is the quadratic form ``delta^T G delta``
+            instead of the diagonal per-channel weighted squares.
     """
 
     losses: list[torch.Tensor] = []
@@ -609,10 +622,18 @@ def _solve_exact_hierarchy(
         local_scale = scale[:, None, None, None] * float(1 << total_exponent)
         mant_code = torch.round(x_abs * (4.0 / local_scale)).clamp_(0.0, 7.0)
         mantissa = mant_code * 0.25
-        error = (x_abs - mantissa * local_scale).square()
-        if importance is not None:
-            error = error * importance
-        losses.append(error.sum(dim=-1))
+        if group_gram is not None:
+            delta = sign * (x_abs - mantissa * local_scale)
+            losses.append(
+                torch.einsum(
+                    "nabi,nabij,nabj->nab", delta, group_gram, delta
+                )
+            )
+        else:
+            error = (x_abs - mantissa * local_scale).square()
+            if importance is not None:
+                error = error * importance
+            losses.append(error.sum(dim=-1))
         mantissas.append(mantissa)
 
     loss_0, loss_1, loss_2 = losses
@@ -666,6 +687,7 @@ def _dense_to_hif4(
     dense: torch.Tensor,
     *,
     importance: Optional[torch.Tensor] = None,
+    group_gram: Optional[torch.Tensor] = None,
     search_offsets: Optional[Union[Sequence[int], torch.Tensor]] = None,
     error_threshold: float = 0.0,
     accept_margin: float = 0.0,
@@ -673,6 +695,20 @@ def _dense_to_hif4(
     max_refine_blocks: Optional[int] = None,
 ) -> dict[str, torch.Tensor]:
     """Quantize a dense tensor into valid HiF4 parameters."""
+
+    if group_gram is not None:
+        expected_gram_shape = dense.shape[:-1] + (
+            dense.shape[-1] // 64,
+            8,
+            2,
+            4,
+            4,
+        )
+        if tuple(group_gram.shape) != tuple(expected_gram_shape):
+            raise ValueError(
+                f"group_gram shape {tuple(group_gram.shape)} does not match "
+                f"expected {expected_gram_shape}"
+            )
 
     if dense.ndim < 1:
         raise ValueError("dense must have at least one dimension")
@@ -731,7 +767,14 @@ def _dense_to_hif4(
     channel_importance = _normalize_importance(importance, channels)
     if channel_importance is not None:
         channel_importance = channel_importance.to(x.device)
-    if channel_importance is None:
+    if group_gram is not None:
+        delta = sign * (x_abs - mantissa * denominator)
+        weighted_error = torch.einsum(
+            "...abi,...abij,...abj->...ab", delta, group_gram, delta
+        )
+        weighted_energy = x_abs.square()
+        importance_view = None
+    elif channel_importance is None:
         weighted_error = (x_abs - mantissa * denominator).square()
         weighted_energy = x_abs.square()
         importance_view = None
@@ -742,7 +785,8 @@ def _dense_to_hif4(
         weighted_error = (x_abs - mantissa * denominator).square() * importance_view
         weighted_energy = x_abs.square() * importance_view
 
-    standard_loss = weighted_error.sum(dim=(-1, -2, -3))
+    loss_reduce_dims = (-1, -2) if group_gram is not None else (-1, -2, -3)
+    standard_loss = weighted_error.sum(dim=loss_reduce_dims)
     energy = weighted_energy.sum(dim=(-1, -2, -3))
     normalized_error = standard_loss / (energy + _EPS)
 
@@ -788,6 +832,12 @@ def _dense_to_hif4(
     best_mantissa = mantissa.reshape(-1, 8, 2, 4).index_select(
         0, hard_indices
     ).clone()
+    sign_hard = sign.reshape(-1, 8, 2, 4).index_select(0, hard_indices)
+    group_gram_hard = (
+        None
+        if group_gram is None
+        else group_gram.reshape(-1, 8, 2, 4, 4).index_select(0, hard_indices)
+    )
     best_offset = torch.zeros(
         int(hard_indices.numel()), dtype=torch.int64, device=x.device
     )
@@ -805,7 +855,13 @@ def _dense_to_hif4(
         ).clamp(min=0, max=254)
         candidate_scale = _e6m2_decode(candidate_code)
         candidate_loss, candidate_lv2, candidate_lv3, candidate_mantissa = (
-            _solve_exact_hierarchy(x_hard, candidate_scale, importance_hard)
+            _solve_exact_hierarchy(
+                x_hard,
+                candidate_scale,
+                importance_hard,
+                sign_hard,
+                group_gram_hard,
+            )
         )
 
         improve = candidate_loss < best_loss
@@ -854,6 +910,12 @@ def _dense_to_hif4(
                         x_hard.index_select(0, edge_indices),
                         edge_scale,
                         edge_importance,
+                        sign_hard.index_select(0, edge_indices),
+                        (
+                            None
+                            if group_gram_hard is None
+                            else group_gram_hard.index_select(0, edge_indices)
+                        ),
                     )
                 )
                 improve = edge_loss < best_loss.index_select(0, edge_indices)
@@ -1075,6 +1137,14 @@ def hif4_calibration_and_quantize_weight(
     activation_amax = torch.zeros_like(sum_square)
     token_count = 0
     activation_samples: list[torch.Tensor] = []
+    use_quadratic = (
+        _WEIGHT_QUADRATIC
+        and in_features <= _WEIGHT_QUADRATIC_MAX_FEATURES
+    )
+    if use_quadratic:
+        cov_sum = torch.zeros(
+            in_features, in_features, dtype=torch.float32, device=weight.device
+        )
 
     for pair in calib_activation_list:
         if not isinstance(pair, (tuple, list)) or len(pair) != 2:
@@ -1084,6 +1154,8 @@ def hif4_calibration_and_quantize_weight(
             raise ValueError("Calibration activation shape is incompatible with weight")
         stats_sample = _sample_rows(activation, _LINEAR_STATS_TOKENS)
         sum_square += stats_sample.square().sum(dim=0)
+        if use_quadratic:
+            cov_sum += stats_sample.t().mm(stats_sample)
         activation_amax = torch.maximum(
             activation_amax, stats_sample.abs().amax(dim=0)
         )
@@ -1164,9 +1236,25 @@ def hif4_calibration_and_quantize_weight(
     h_x_smooth = (activation_second_moment / best_d.square()).index_select(
         0, best_perm
     )
+    weight_group_gram = None
+    if use_quadratic:
+        gram = cov_sum / float(max(token_count, 1))
+        d = best_d.to(gram.dtype)
+        gram = gram / d.unsqueeze(0) / d.unsqueeze(1)
+        gram = gram.index_select(0, best_perm).index_select(1, best_perm)
+        blocks = in_features // _HIF4_BLOCK_SIZE
+        g = gram.reshape(blocks, 64, blocks, 64)
+        g = torch.diagonal(g, dim1=0, dim2=2).permute(2, 0, 1)
+        g = g.reshape(blocks, 16, 4, 16, 4)
+        g = torch.diagonal(g, dim1=1, dim2=3).permute(0, 3, 1, 2)
+        g = g.reshape(blocks, 8, 2, 4, 4)
+        weight_group_gram = g.unsqueeze(0).expand(
+            int(weight.shape[0]), blocks, 8, 2, 4, 4
+        )
     weight_params = _dense_to_hif4(
         weight_smooth,
         importance=h_x_smooth,
+        group_gram=weight_group_gram,
         search_offsets=_WEIGHT_OFFSETS,
         error_threshold=_WEIGHT_REFINE_ERROR_THRESHOLD,
         accept_margin=_WEIGHT_REFINE_ACCEPT_MARGIN,
