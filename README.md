@@ -13,6 +13,7 @@
 | `real_data_eval.py` | 真实 GPT-2 端到端评测：按比赛口径输出 Linear / Attention 得分 |
 | `e2e_eval.py` | 小型 Transformer 端到端冒烟评测（logits 误差 + top1） |
 | `sweep_eval.py` | 参数/算法开关扫描：真实数据只加载编码一次，逐配置重跑校准+打分 |
+| `shape_smoke.py` | 非 GPT-2 几何冒烟：head_dim 128 + GQA、宽 Linear（1536/6144 通道） |
 | `time_breakdown.py` | 校准 vs 每样本动态量化耗时拆解，用于 5 分钟预算评估 |
 | `test_solution.py` | 离线回归测试：确定性、合法性、重建误差 |
 
