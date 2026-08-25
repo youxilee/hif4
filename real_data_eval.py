@@ -67,16 +67,31 @@ def std_hif4(dense: torch.Tensor) -> torch.Tensor:
     ).to(torch.float32)
 
 
-def causal_attn(Q, K, V, qh: int, hd: int) -> torch.Tensor:
+def causal_attn(Q, K, V, qh: int, kvh: int, hd: int) -> torch.Tensor:
+    """Causal GQA attention (kvh == qh 时为 MHA，与旧签名等价)。"""
     B, T, _ = Q.shape
     q = Q.reshape(B, T, qh, hd).transpose(1, 2)
-    k = K.reshape(B, T, qh, hd).transpose(1, 2)
-    v = V.reshape(B, T, qh, hd).transpose(1, 2)
+    group = qh // kvh
+    k = K.reshape(B, T, kvh, hd).transpose(1, 2).repeat_interleave(group, dim=1)
+    v = V.reshape(B, T, kvh, hd).transpose(1, 2).repeat_interleave(group, dim=1)
     scores = q @ k.transpose(-1, -2) / math.sqrt(hd)
     mask = torch.triu(torch.full((T, T), float("-inf"), device=scores.device), 1)
     scores = scores + mask
     att = torch.softmax(scores, -1)
     return (att @ v).transpose(1, 2).reshape(B, T, qh * hd)
+
+
+def to_gqa_kv(kv_dense: torch.Tensor, qh: int, kvh: int, hd: int) -> torch.Tensor:
+    """把 MHA 的 K/V 稠密张量按 head 分组求均值，合成 GQA 的 K/V。
+
+    GPT-2 只有 MHA 权重，这里把每个 KV head 取为同组 q-head 的均值，
+    数据分布仍然来自真实前向，用于烟测 GQA 校准/动态量化路径。
+    """
+
+    group = qh // kvh
+    return kv_dense.reshape(-1, kvh, group, hd).mean(dim=2).reshape(
+        -1, kvh * hd
+    )
 
 
 def set_config(kind: str) -> None:
@@ -216,26 +231,27 @@ def score_linear(w_pair, act_pairs, act_state, wp):
     return sum(scores) / len(scores)
 
 
-def score_attention(qkv_pairs, q_state, k_state, v_state, qh, hd):
+def score_attention(qkv_pairs, q_state, k_state, v_state, qh, kvh, hd):
     scores = []
     for q_pair, k_pair, v_pair in qkv_pairs:
         Q_ref = s._dequantize_nvfp4_float32(*q_pair)
         K_ref = s._dequantize_nvfp4_float32(*k_pair)
         V_ref = s._dequantize_nvfp4_float32(*v_pair)
-        A_ref = causal_attn(Q_ref[None], K_ref[None], V_ref[None], qh, hd)
+        A_ref = causal_attn(Q_ref[None], K_ref[None], V_ref[None], qh, kvh, hd)
         A_std = causal_attn(
-            std_hif4(Q_ref)[None], std_hif4(K_ref)[None], std_hif4(V_ref)[None], qh, hd
+            std_hif4(Q_ref)[None], std_hif4(K_ref)[None],
+            std_hif4(V_ref)[None], qh, kvh, hd,
         )
         Q_h = s._dequantize_hif4(
             s.hif4_dynamic_quantize_q(*q_pair, qh, hd, q_state)
         ).to(torch.float32)
         K_h = s._dequantize_hif4(
-            s.hif4_dynamic_quantize_k(*k_pair, qh, hd, k_state)
+            s.hif4_dynamic_quantize_k(*k_pair, kvh, hd, k_state)
         ).to(torch.float32)
         V_h = s._dequantize_hif4(
-            s.hif4_dynamic_quantize_v(*v_pair, qh, hd, v_state)
+            s.hif4_dynamic_quantize_v(*v_pair, kvh, hd, v_state)
         ).to(torch.float32)
-        A_h = causal_attn(Q_h[None], K_h[None], V_h[None], qh, hd)
+        A_h = causal_attn(Q_h[None], K_h[None], V_h[None], qh, kvh, hd)
         m_std = float(((A_std - A_ref).square()).mean())
         m_h = float(((A_h - A_ref).square()).mean())
         scores.append((m_std - m_h) / m_std)
@@ -250,6 +266,9 @@ def main() -> int:
     ap.add_argument("--test", type=int, default=2)
     ap.add_argument("--mode", default="amax6", choices=["amax6", "amax4", "pow2"])
     ap.add_argument("--config", default="both", choices=["both", "original", "current"])
+    ap.add_argument("--kv-heads", type=int, default=None,
+                    help="GQA 烟测：把真实 K/V 按 head 分组均值合成 kvh 个 KV head"
+                         "（默认等于 q_heads，即 MHA）")
     args = ap.parse_args()
 
     model, weights, calib, test, qh, hd = collect_real_data(
@@ -257,6 +276,12 @@ def main() -> int:
     )
     L = len(weights)
     hidden = model.config.n_embd
+    qh = model.config.n_head
+    kvh = args.kv_heads if args.kv_heads is not None else qh
+    if qh % kvh != 0:
+        raise ValueError(f"--kv-heads {kvh} must divide q_heads {qh}")
+    group = qh // kvh
+    gqa = kvh != qh
 
     results = {}
     for cfg in (("original", "current") if args.config == "both" else (args.config,)):
@@ -281,21 +306,27 @@ def main() -> int:
                     score_linear(w_pair, test_pairs,
                                  res["activation_state"], res["weight_params"])
                 )
-            # attention：q/k/v 用各自层的校准数据
+            # attention：q/k/v 用各自层的校准数据（GQA 时 K/V 按分组均值合成）
             qkv_calib = []
             for b in range(args.calib):
                 dense = calib["qkv"][b * L + i].reshape(-1, 3 * hidden)
                 q_, k_, v_ = dense.chunk(3, dim=-1)
+                if gqa:
+                    k_ = to_gqa_kv(k_, qh, kvh, hd)
+                    v_ = to_gqa_kv(v_, qh, kvh, hd)
                 qkv_calib.append(
                     {"q": nvfp4_encode(q_, args.mode),
                      "k": nvfp4_encode(k_, args.mode),
                      "v": nvfp4_encode(v_, args.mode)}
                 )
-            att = s.hif4_calibration_attention(qkv_calib, qh, qh, hd)
+            att = s.hif4_calibration_attention(qkv_calib, qh, kvh, hd)
             qkv_test = []
             for b in range(args.test):
                 dense = test["qkv"][b * L + i].reshape(-1, 3 * hidden)
                 q_, k_, v_ = dense.chunk(3, dim=-1)
+                if gqa:
+                    k_ = to_gqa_kv(k_, qh, kvh, hd)
+                    v_ = to_gqa_kv(v_, qh, kvh, hd)
                 qkv_test.append(
                     (nvfp4_encode(q_, args.mode),
                      nvfp4_encode(k_, args.mode),
@@ -303,12 +334,12 @@ def main() -> int:
                 )
             attn_scores.append(
                 score_attention(qkv_test, att["q_state"], att["k_state"],
-                                att["v_state"], qh, hd)
+                                att["v_state"], qh, kvh, hd)
             )
         results[cfg] = (lin, attn_scores)
 
     print(f"GPT-2 layers={L} hidden={hidden} heads={qh}x{hd} mode={args.mode} "
-          f"seq={args.seq} calib={args.calib} test={args.test}")
+          f"kv_heads={kvh} seq={args.seq} calib={args.calib} test={args.test}")
     for cfg, (lin, attn_scores) in results.items():
         print(f"\n[{cfg}] Linear 得分（按层平均）:")
         for name in ("q", "k", "v", "o", "fc", "proj"):
