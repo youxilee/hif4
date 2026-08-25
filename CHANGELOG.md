@@ -37,7 +37,8 @@ fc +0.004、q/k/v +0.001~0.003；Attention 不变（权重与注意力无关）�
 原因：Q/K 的 4×4 协方差仅由约 128 个标定 token 估计，方差大，求解器
 会利用不稳定的组内相关"对消"误差，而 softmax 的指数敏感性放大过拟合。
 结论：二次型只适用于离线权重（协方差估计稳、100% refine），动态
-Q/K 保持对角重要性。代码保留在 `_ATTN_QUADRATIC` 开关后。
+Q/K 保持对角重要性。相关代码已在清理时删除，完整实现保留在
+git 历史（commit 86558f4 之前）。
 
 ## v1.1 — 数据驱动 refine 预算 + scale 边缘扩展（commit 待补）
 
@@ -58,7 +59,7 @@ HiF4 每个 64 块在给定 E6M2 base scale 后，lv2/lv3/mantissa 的精确解
 
 - **校准期按组件选择 offset**（`_OFFSET_SELECTION`）：统计每个 offset
   的损失贡献并按层保留 top-4。实测无正收益（+4 伤 proj 类层，选择本身
-  略降 attn），默认关闭，代码保留供后续实验。
+  略降 attn），已删除，完整实现保留在 git 历史（commit 86558f4 之前）。
 - 动态 offset 池加回 -2、mean 居中、评估 token 数翻倍：均无提升。
 
 ### 实测（真实 GPT-2，12 层，seq 128，权威 NVFP4 编码；得分越高越好）
