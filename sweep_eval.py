@@ -45,27 +45,56 @@ def make_configs() -> list[tuple[str, dict]]:
     }
     return [
         ("old", old),                      # 代码改动前的行为
-        ("new", new),                      # 三项代码改动全部开启
-        ("w_alpha075", {**new,
-                        "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
-        ("qkv_up", {**new,
-                    "_Q_REFINE_MAX_RATIO": 0.4,
-                    "_K_REFINE_MAX_RATIO": 0.5,
-                    "_V_REFINE_MAX_RATIO": 0.4}),
-        ("act05", {**new, "_ACTIVATION_REFINE_MAX_RATIO": 0.5}),
-        ("combo", {**new,
+        ("combo", {**new,                      # v1.0 基线
                    "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
                    "_Q_REFINE_MAX_RATIO": 0.4,
                    "_K_REFINE_MAX_RATIO": 0.5,
                    "_V_REFINE_MAX_RATIO": 0.4,
                    "_ACTIVATION_REFINE_MAX_RATIO": 0.5}),
-        ("combo_off4", {**new,
-                        "_WEIGHT_OFFSETS": (-2, -1, 1, 2, 3, 4),
-                        "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
-                        "_Q_REFINE_MAX_RATIO": 0.4,
-                        "_K_REFINE_MAX_RATIO": 0.5,
-                        "_V_REFINE_MAX_RATIO": 0.4,
-                        "_ACTIVATION_REFINE_MAX_RATIO": 0.5}),
+        ("r1", {**new,                          # v1.1 候选：比例上调
+                "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
+                "_Q_REFINE_MAX_RATIO": 0.5,
+                "_K_REFINE_MAX_RATIO": 0.6,
+                "_V_REFINE_MAX_RATIO": 0.5,
+                "_ACTIVATION_REFINE_MAX_RATIO": 0.6}),
+        ("r1_edge", {**new,                     # + 边缘扩展
+                     "_REFINE_EDGE_EXTENSION": True,
+                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
+                     "_Q_REFINE_MAX_RATIO": 0.5,
+                     "_K_REFINE_MAX_RATIO": 0.6,
+                     "_V_REFINE_MAX_RATIO": 0.5,
+                     "_ACTIVATION_REFINE_MAX_RATIO": 0.6}),
+        ("r1_edge_dyn-2", {**new,               # + 边缘扩展 + 动态 -2
+                           "_REFINE_EDGE_EXTENSION": True,
+                           "_DYNAMIC_OFFSETS": (-2, -1, 1, 2, 3),
+                           "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
+                           "_Q_REFINE_MAX_RATIO": 0.5,
+                           "_K_REFINE_MAX_RATIO": 0.6,
+                           "_V_REFINE_MAX_RATIO": 0.5,
+                           "_ACTIVATION_REFINE_MAX_RATIO": 0.6}),
+        ("r2_edge", {**new,                     # 比例再上调 + 边缘扩展
+                     "_REFINE_EDGE_EXTENSION": True,
+                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
+                     "_Q_REFINE_MAX_RATIO": 0.6,
+                     "_K_REFINE_MAX_RATIO": 0.7,
+                     "_V_REFINE_MAX_RATIO": 0.6,
+                     "_ACTIVATION_REFINE_MAX_RATIO": 0.7}),
+        ("ddr_t95", {**new,                     # 数据驱动预算 95%
+                     "_REFINE_EDGE_EXTENSION": True,
+                     "_DATA_DRIVEN_RATIO": True,
+                     "_RATIO_CAPTURE_TARGET": 0.95,
+                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
+        ("ddr_t99", {**new,                     # 数据驱动预算 99%
+                     "_REFINE_EDGE_EXTENSION": True,
+                     "_DATA_DRIVEN_RATIO": True,
+                     "_RATIO_CAPTURE_TARGET": 0.99,
+                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
+        ("ddr_t95_cap", {**new,                 # 95% 且上限 0.7
+                         "_REFINE_EDGE_EXTENSION": True,
+                         "_DATA_DRIVEN_RATIO": True,
+                         "_RATIO_CAPTURE_TARGET": 0.95,
+                         "_RATIO_MAX": 0.7,
+                         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
     ]
 
 
@@ -90,6 +119,16 @@ def apply_config(overrides: dict) -> None:
         "_WEIGHT_SMOOTH_RMS": False,
         "_QK_SMOOTH_RMS": False,
         "_REFINE_RANK_BY_ABSOLUTE": False,
+        "_OFFSET_SELECTION": False,
+        "_OFFSET_SELECTION_POOL": (-2, -1, 1, 2, 3, 4),
+        "_REFINE_EDGE_EXTENSION": False,
+        "_REFINE_EDGE_EXTEND_STEPS": 2,
+        "_DATA_DRIVEN_RATIO": False,
+        "_RATIO_CAPTURE_TARGET": 0.95,
+        "_RATIO_MIN": 0.10,
+        "_RATIO_MAX": 1.0,
+        "_LINEAR_EVAL_TOKENS": 128,
+        "_ATTN_EVAL_TOKENS": 128,
         "_IMPORTANCE_FLOOR": 0.05,
     }
     for key, value in {**defaults, **overrides}.items():
