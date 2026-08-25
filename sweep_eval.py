@@ -29,13 +29,31 @@ from nvfp4_sim import nvfp4_encode  # noqa: E402
 
 
 def make_configs() -> list[tuple[str, dict]]:
-    """(名字, 覆盖项)。每个配置从 DEFAULT 出发，只覆盖列出的键。"""
+    """(名字, 覆盖项)。每个配置从 DEFAULT 出发，只覆盖列出的键。
+
+    基准行固定为 best（当前最佳版本），所有百分比都相对 best 计算；
+    old 仅保留作历史参考，不参与对比。
+    """
 
     old = {
         "_WEIGHT_SMOOTH_RMS": False,
         "_QK_SMOOTH_RMS": False,
         "_REFINE_RANK_BY_ABSOLUTE": False,
         "_ATTN_CENTER_MODES": (0, 2),
+    }
+    best = {
+        "_WEIGHT_SMOOTH_RMS": True,
+        "_QK_SMOOTH_RMS": True,
+        "_REFINE_RANK_BY_ABSOLUTE": True,
+        "_ATTN_CENTER_MODES": (0, 2),
+        "_REFINE_EDGE_EXTENSION": True,
+        "_DATA_DRIVEN_RATIO": True,
+        "_RATIO_CAPTURE_TARGET": 0.99,
+        "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
+        "_Q_REFINE_MAX_RATIO": 0.60,
+        "_K_REFINE_MAX_RATIO": 0.70,
+        "_V_REFINE_MAX_RATIO": 0.60,
+        "_ACTIVATION_REFINE_MAX_RATIO": 0.70,
     }
     new = {
         "_WEIGHT_SMOOTH_RMS": True,
@@ -44,57 +62,12 @@ def make_configs() -> list[tuple[str, dict]]:
         "_ATTN_CENTER_MODES": (0, 2, 3),
     }
     return [
+        ("best", best),                      # 当前最佳版本（基准）
         ("old", old),                      # 代码改动前的行为
-        ("combo", {**new,                      # v1.0 基线
-                   "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
-                   "_Q_REFINE_MAX_RATIO": 0.4,
-                   "_K_REFINE_MAX_RATIO": 0.5,
-                   "_V_REFINE_MAX_RATIO": 0.4,
-                   "_ACTIVATION_REFINE_MAX_RATIO": 0.5}),
-        ("r1", {**new,                          # v1.1 候选：比例上调
-                "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
-                "_Q_REFINE_MAX_RATIO": 0.5,
-                "_K_REFINE_MAX_RATIO": 0.6,
-                "_V_REFINE_MAX_RATIO": 0.5,
-                "_ACTIVATION_REFINE_MAX_RATIO": 0.6}),
-        ("r1_edge", {**new,                     # + 边缘扩展
-                     "_REFINE_EDGE_EXTENSION": True,
-                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
-                     "_Q_REFINE_MAX_RATIO": 0.5,
-                     "_K_REFINE_MAX_RATIO": 0.6,
-                     "_V_REFINE_MAX_RATIO": 0.5,
-                     "_ACTIVATION_REFINE_MAX_RATIO": 0.6}),
-        ("r1_edge_dyn-2", {**new,               # + 边缘扩展 + 动态 -2
-                           "_REFINE_EDGE_EXTENSION": True,
-                           "_DYNAMIC_OFFSETS": (-2, -1, 1, 2, 3),
-                           "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
-                           "_Q_REFINE_MAX_RATIO": 0.5,
-                           "_K_REFINE_MAX_RATIO": 0.6,
-                           "_V_REFINE_MAX_RATIO": 0.5,
-                           "_ACTIVATION_REFINE_MAX_RATIO": 0.6}),
-        ("r2_edge", {**new,                     # 比例再上调 + 边缘扩展
-                     "_REFINE_EDGE_EXTENSION": True,
-                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
-                     "_Q_REFINE_MAX_RATIO": 0.6,
-                     "_K_REFINE_MAX_RATIO": 0.7,
-                     "_V_REFINE_MAX_RATIO": 0.6,
-                     "_ACTIVATION_REFINE_MAX_RATIO": 0.7}),
-        ("ddr_t95", {**new,                     # 数据驱动预算 95%
-                     "_REFINE_EDGE_EXTENSION": True,
-                     "_DATA_DRIVEN_RATIO": True,
-                     "_RATIO_CAPTURE_TARGET": 0.95,
-                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
-        ("ddr_t99", {**new,                     # 数据驱动预算 99%
-                     "_REFINE_EDGE_EXTENSION": True,
-                     "_DATA_DRIVEN_RATIO": True,
-                     "_RATIO_CAPTURE_TARGET": 0.99,
-                     "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
-        ("ddr_t95_cap", {**new,                 # 95% 且上限 0.7
-                         "_REFINE_EDGE_EXTENSION": True,
-                         "_DATA_DRIVEN_RATIO": True,
-                         "_RATIO_CAPTURE_TARGET": 0.95,
-                         "_RATIO_MAX": 0.7,
-                         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75)}),
+        ("cand_A", {**best,                    # 示例候选：直接改动这里
+                    "_RATIO_CAPTURE_TARGET": 0.95}),
+        ("cand_B", {**best,                    # 示例候选
+                    "_DYNAMIC_OFFSETS": (-2, -1, 1, 2, 3)}),
     ]
 
 
@@ -248,11 +221,11 @@ def main() -> int:
             f"{k}={v:.4f}" for k, v in row.items() if k not in ("cfg", "time")
         ), flush=True)
 
-    base = next(r for r in rows if r["cfg"] == "old")
-    print("\n相对 base 的变化:")
+    base = next(r for r in rows if r["cfg"] == "best")
+    print("\n相对 best（当前最佳）的变化:")
     for row in rows[1:]:
         parts = []
-        if row["cfg"] == "old":
+        if row["cfg"] in ("best", "old"):
             continue
         for key in ("q", "k", "v", "o", "fc", "proj", "attn"):
             delta = row[key] - base[key]
