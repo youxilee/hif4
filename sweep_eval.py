@@ -74,6 +74,9 @@ def make_configs() -> list[tuple[str, dict]]:
         ("no_perm_bases", {**best, "_PERMUTATION_BASES": False}),
         ("no_v_imp", {**best, "_V_ATTENTION_IMPORTANCE": False}),
         ("v_imp_shrink", {**best, "_V_ATTENTION_IMPORTANCE_SHRINK": 0.5}),
+        ("ratio95", {**best, "_RATIO_CAPTURE_TARGET": 0.95}),
+        ("ratio90", {**best, "_RATIO_CAPTURE_TARGET": 0.90}),
+        ("ratio80", {**best, "_RATIO_CAPTURE_TARGET": 0.80}),
     ]
 
 

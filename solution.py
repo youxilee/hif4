@@ -545,14 +545,14 @@ def _solve_exact_hierarchy(
     mantissas: list[torch.Tensor] = []
 
     for total_exponent in (0, 1, 2):
-        local_scale = scale[:, None, None, None] * float(1 << total_exponent)
+        local_scale = scale[..., None, None, None] * float(1 << total_exponent)
         mant_code = torch.round(x_abs * (4.0 / local_scale)).clamp_(0.0, 7.0)
         mantissa = mant_code * 0.25
         if group_gram is not None:
             delta = sign * (x_abs - mantissa * local_scale)
             losses.append(
                 torch.einsum(
-                    "nabi,nabij,nabj->nab", delta, group_gram, delta
+                    "...abi,...abij,...abj->...ab", delta, group_gram, delta
                 )
             )
         else:
@@ -574,10 +574,15 @@ def _solve_exact_hierarchy(
     block_loss = torch.where(e2, cost_e2_1, cost_e2_0).sum(dim=-1)
     total_exponent = e2.to(torch.int64)[..., None] + e3.to(torch.int64)
 
-    # [N, 8, 2, 3, 4], gather the mantissa matching k=e2+e3.
-    mantissa_stack = torch.stack(mantissas, dim=3)
-    gather_index = total_exponent[..., None, None].expand(-1, -1, -1, 1, 4)
-    mantissa = torch.gather(mantissa_stack, 3, gather_index).squeeze(3)
+    # [..., 3, 4]，指数维固定在倒数第二维（批量时随输入维度自然后移）。
+    mantissa_stack = torch.stack(mantissas, dim=-2)
+    gather_index = total_exponent[..., None, None].expand(
+        *total_exponent.shape, 1, 4
+    )
+    gather_dim = mantissa_stack.ndim - 2  # 指数维：4D 输入为 3，批量时随维度后移
+    mantissa = torch.gather(
+        mantissa_stack, gather_dim, gather_index
+    ).squeeze(-2)
 
     scale_lv2 = 1.0 + e2.to(torch.float32)
     scale_lv3 = 1.0 + e3.to(torch.float32)
@@ -775,34 +780,67 @@ def _dense_to_hif4(
         channel_block_ids = torch.remainder(hard_indices, blocks)
         importance_hard = block_importance.index_select(0, channel_block_ids)
 
-    for offset in offsets:
-        candidate_code = (
-            standard_code_hard.to(torch.int64) + int(offset)
-        ).clamp(min=0, max=254)
-        candidate_scale = _e6m2_decode(candidate_code)
-        candidate_loss, candidate_lv2, candidate_lv3, candidate_mantissa = (
-            _solve_exact_hierarchy(
-                x_hard,
-                candidate_scale,
-                importance_hard,
-                sign_hard,
-                group_gram_hard,
-            )
+    # 全部 offset 一次性批量求解：把 [N] 块沿 offset 维展开成 [K, N]，
+    # 一次精确求解后按块取 argmin。标准 code（offset 0）必须保留在候选里：
+    # 阈值式 lv2/lv3 与精确解不等价（真实数据约半数块有更低损失），
+    # offset 0 会把 hard 块的 lv2/lv3 升级为精确解。
+    offset_values = torch.tensor(
+        [int(o) for o in offsets], dtype=torch.int64, device=x.device
+    )
+    expanded_codes = (
+        standard_code_hard.to(torch.int64).unsqueeze(0)
+        + offset_values.unsqueeze(1)
+    ).clamp(min=0, max=254)
+    candidate_scales = _e6m2_decode(expanded_codes)
+    num_offsets = int(offset_values.numel())
+    x_expanded = x_hard.unsqueeze(0).expand(
+        num_offsets, -1, -1, -1, -1
+    )
+    sign_expanded = sign_hard.unsqueeze(0).expand(
+        num_offsets, -1, -1, -1, -1
+    )
+    importance_expanded = (
+        None
+        if importance_hard is None
+        else importance_hard.unsqueeze(0).expand(
+            num_offsets, -1, -1, -1, -1
         )
+    )
+    gram_expanded = (
+        None
+        if group_gram_hard is None
+        else group_gram_hard.unsqueeze(0).expand(
+            num_offsets, -1, -1, -1, -1, -1
+        )
+    )
+    all_losses, all_lv2, all_lv3, all_mantissa = _solve_exact_hierarchy(
+        x_expanded,
+        candidate_scales,
+        importance_expanded,
+        sign_expanded,
+        gram_expanded,
+    )
+    best_k = all_losses.argmin(dim=0)
+    hard_arange = torch.arange(
+        int(hard_indices.numel()), device=x.device
+    )
+    candidate_loss = all_losses[best_k, hard_arange]
+    candidate_scale = candidate_scales[best_k, hard_arange]
+    candidate_lv2 = all_lv2[best_k, hard_arange]
+    candidate_lv3 = all_lv3[best_k, hard_arange]
+    candidate_mantissa = all_mantissa[best_k, hard_arange]
 
-        improve = candidate_loss < best_loss
-        best_loss = torch.where(improve, candidate_loss, best_loss)
-        best_scale = torch.where(improve, candidate_scale, best_scale)
-        best_lv2 = torch.where(improve[:, None], candidate_lv2, best_lv2)
-        best_lv3 = torch.where(improve[:, None, None], candidate_lv3, best_lv3)
-        best_mantissa = torch.where(
-            improve[:, None, None, None], candidate_mantissa, best_mantissa
-        )
-        best_offset = torch.where(
-            improve,
-            torch.full_like(best_offset, int(offset)),
-            best_offset,
-        )
+    improve = candidate_loss < best_loss
+    best_loss = torch.where(improve, candidate_loss, best_loss)
+    best_scale = torch.where(improve, candidate_scale, best_scale)
+    best_lv2 = torch.where(improve[:, None], candidate_lv2, best_lv2)
+    best_lv3 = torch.where(improve[:, None, None], candidate_lv3, best_lv3)
+    best_mantissa = torch.where(
+        improve[:, None, None, None], candidate_mantissa, best_mantissa
+    )
+    best_offset = torch.where(
+        improve, offset_values[best_k], best_offset
+    )
 
     if _REFINE_EDGE_EXTENSION and len(offsets) > 1:
         lo_offset = int(offsets[0])
