@@ -55,6 +55,8 @@ def make_configs() -> list[tuple[str, dict]]:
         "_V_ATTENTION_IMPORTANCE": True,
         "_V_ATTENTION_IMPORTANCE_SHRINK": 1.0,
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
+        "_WEIGHT_SMOOTH_ALPHAS_WIDE": (0.25, 0.375, 0.50, 0.625, 0.75),
+        "_WIDE_LAYER_MIN_DIM": 2048,
         "_Q_REFINE_MAX_RATIO": 0.60,
         "_K_REFINE_MAX_RATIO": 0.70,
         "_V_REFINE_MAX_RATIO": 0.60,
@@ -77,6 +79,9 @@ def make_configs() -> list[tuple[str, dict]]:
         ("ratio95", {**best, "_RATIO_CAPTURE_TARGET": 0.95}),
         ("ratio90", {**best, "_RATIO_CAPTURE_TARGET": 0.90}),
         ("ratio80", {**best, "_RATIO_CAPTURE_TARGET": 0.80}),
+        ("no_wide_alphas", {
+            **best, "_WEIGHT_SMOOTH_ALPHAS_WIDE": (0.25, 0.50, 0.75),
+        }),
     ]
 
 
@@ -98,6 +103,8 @@ def apply_config(overrides: dict) -> None:
         "_ATTN_CENTER_MODES": (0, 2),
         "_QK_SMOOTH_ALPHAS": (0.25, 0.50),
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50),
+        "_WEIGHT_SMOOTH_ALPHAS_WIDE": (0.25, 0.50, 0.75),
+        "_WIDE_LAYER_MIN_DIM": 2048,
         "_WEIGHT_SMOOTH_RMS": False,
         "_QK_SMOOTH_RMS": False,
         "_REFINE_RANK_BY_ABSOLUTE": False,

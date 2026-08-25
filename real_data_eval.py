@@ -105,6 +105,8 @@ def set_config(kind: str) -> None:
         s._K_REFINE_MAX_RATIO = 0.12
         s._V_REFINE_MAX_RATIO = 0.1
         s._WEIGHT_SMOOTH_ALPHAS = (0.25, 0.50)
+        s._WEIGHT_SMOOTH_ALPHAS_WIDE = (0.25, 0.50, 0.75)
+        s._WIDE_LAYER_MIN_DIM = 2048
         s._WEIGHT_SMOOTH_RMS = False
         s._QK_SMOOTH_RMS = False
         s._REFINE_RANK_BY_ABSOLUTE = False
@@ -125,6 +127,8 @@ def set_config(kind: str) -> None:
         s._K_REFINE_MAX_RATIO = 0.5
         s._V_REFINE_MAX_RATIO = 0.4
         s._WEIGHT_SMOOTH_ALPHAS = (0.25, 0.50, 0.75)
+        s._WEIGHT_SMOOTH_ALPHAS_WIDE = (0.25, 0.375, 0.50, 0.625, 0.75)
+        s._WIDE_LAYER_MIN_DIM = 2048
         s._WEIGHT_SMOOTH_RMS = True
         s._QK_SMOOTH_RMS = True
         s._REFINE_RANK_BY_ABSOLUTE = True

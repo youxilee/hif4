@@ -33,6 +33,11 @@ _ATTN_EVAL_TOKENS = 128
 # bounded on large models; the sweep harness overrides them to find a better
 # accuracy/runtime trade-off.
 _WEIGHT_SMOOTH_ALPHAS = (0.25, 0.50, 0.75)
+# 宽层（FFN 的 fc/proj，输入或输出 ≥ 2048）用更细的 alpha 网格：
+# 通道多、候选统计更稳，细网格实测 +fc 0.0012 / +proj 0.0044；
+# 窄层（q/k/v/o，768）细网格反而过拟合（-0.0003~-0.0021），保持 3 档。
+_WEIGHT_SMOOTH_ALPHAS_WIDE = (0.25, 0.375, 0.50, 0.625, 0.75)
+_WIDE_LAYER_MIN_DIM = 2048
 _WEIGHT_REFINE_ERROR_THRESHOLD = 1.0e-7
 _WEIGHT_REFINE_ACCEPT_MARGIN = 0.005
 _WEIGHT_REFINE_MAX_RATIO_SMALL = 1.0
@@ -1155,7 +1160,15 @@ def hif4_calibration_and_quantize_weight(
     )
     identity_perm = _identity_permutation(in_features, weight.device)
     smooth_candidates = [identity_d]
-    for alpha in _WEIGHT_SMOOTH_ALPHAS:
+    smooth_alphas = (
+        _WEIGHT_SMOOTH_ALPHAS_WIDE
+        if (
+            in_features >= _WIDE_LAYER_MIN_DIM
+            or out_features >= _WIDE_LAYER_MIN_DIM
+        )
+        else _WEIGHT_SMOOTH_ALPHAS
+    )
+    for alpha in smooth_alphas:
         smooth_candidates.append(
             _smooth_scale(activation_amax, weight_amax, alpha)
         )
