@@ -322,6 +322,7 @@ def set_config(name: str, real_normalize) -> None:
         s._WEIGHT_QUADRATIC = False
         s._ACTIVATION_QUADRATIC = False
         s._PERMUTATION_BASES = False
+        s._V_ATTENTION_IMPORTANCE = False
         s._ATTN_CENTER_MODES = (0, 2)
         s._normalize_importance = _normalize_no_floor
     else:
@@ -342,6 +343,7 @@ def set_config(name: str, real_normalize) -> None:
         s._WEIGHT_QUADRATIC = True
         s._ACTIVATION_QUADRATIC = True
         s._PERMUTATION_BASES = True
+        s._V_ATTENTION_IMPORTANCE = True
         s._ATTN_CENTER_MODES = (0, 2)
         s._normalize_importance = real_normalize
 

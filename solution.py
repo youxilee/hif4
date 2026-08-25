@@ -128,6 +128,16 @@ _ACTIVATION_QUADRATIC_MAX_FEATURES = 1024
 # smoothing candidates.
 _PERMUTATION_BASES = True
 
+# V 量化目前没有任何重要性：V 的误差进入 softmax 输出时被注意力权重
+# 放大，而校准期可以静态估计每 KV head 的平均平方注意力质量
+# E[A^2]（softmax 概率，因果掩码下按 token 位置平均）。head_dim=64 时
+# 一个 HiF4 64 块恰好是一个 head 的一条位置切片，按 head 加权可以直接
+# 作用到块上。与 Q/K 协方差不同，这是静态概率统计，不会过拟合少量 token。
+_V_ATTENTION_IMPORTANCE = True
+# 向均匀权重收缩的比例（0.0 = 均匀，1.0 = 完全按 E[A^2] 加权），
+# 实测完全加权最优（attn +0.0010），收缩反而稀释收益。
+_V_ATTENTION_IMPORTANCE_SHRINK = 1.0
+
 
 def dequantize_nvfp4(
     quant_float: torch.Tensor,
@@ -419,6 +429,33 @@ def _center_attention_k(
     else:
         raise ValueError("Unsupported attention center mode")
     return (grouped - center).reshape_as(dense)
+
+
+def _attention_head_square_mass(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_num_heads: int,
+    kv_num_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """每个 KV head 的平均平方注意力质量 E[A^2]（因果 softmax）。
+
+    V 输出误差被 A 加权，输出 MSE 中 V 通道的静态权重近似为
+    ``E_t,s[A(t,s,h)^2]``。GQA 下每个 KV head 对应 group 个 Q head，
+    取组内平均。返回 ``[kv_num_heads]``。
+    """
+
+    seq = int(q.shape[0])
+    group = q_num_heads // kv_num_heads
+    qh = q.reshape(seq, q_num_heads, head_dim)
+    kh = k.reshape(seq, kv_num_heads, head_dim).repeat_interleave(group, dim=1)
+    scores = torch.einsum("thd,shd->tsh", qh, kh) / math.sqrt(float(head_dim))
+    mask = torch.triu(
+        torch.full((seq, seq), float("-inf"), device=scores.device), 1
+    ).unsqueeze(-1)
+    probs = torch.softmax(scores + mask, dim=1)
+    per_q_head = probs.square().mean(dim=(0, 1))
+    return per_q_head.reshape(kv_num_heads, group).mean(dim=1)
 
 
 def _e6m2_encode_nearest(value: torch.Tensor) -> torch.Tensor:
@@ -1405,6 +1442,7 @@ def hif4_calibration_attention(
     q_token_count = 0
     k_token_count = 0
     sample_count = 0
+    v_head_mass = torch.zeros(kv_num_heads, dtype=torch.float32)
     q_samples: list[torch.Tensor] = []
     k_samples: list[torch.Tensor] = []
     v_samples: list[torch.Tensor] = []
@@ -1431,6 +1469,11 @@ def hif4_calibration_attention(
         if int(q.shape[0]) != int(k.shape[0]) or int(k.shape[0]) != int(v_quant.shape[0]):
             raise ValueError("Q/K/V in a calibration sample must share seq_len")
 
+        if _V_ATTENTION_IMPORTANCE:
+            v_head_mass += _attention_head_square_mass(
+                q, k, q_num_heads, kv_num_heads, head_dim
+            )
+
         q_stats = _sample_rows(q, _ATTN_STATS_TOKENS).reshape(
             -1, q_num_heads, head_dim
         )
@@ -1456,6 +1499,21 @@ def hif4_calibration_attention(
         k_samples.append(_sample_rows(k, _ATTN_EVAL_TOKENS).clone())
         v_dense = _dequantize_nvfp4_float32(v_quant, v_scale)
         v_samples.append(_sample_rows(v_dense, _ATTN_EVAL_TOKENS).clone())
+
+    v_importance = None
+    if _V_ATTENTION_IMPORTANCE and sample_count > 0:
+        head_importance = v_head_mass / float(max(sample_count, 1))
+        head_importance = head_importance / head_importance.mean().clamp_min(
+            _EPS
+        )
+        if _V_ATTENTION_IMPORTANCE_SHRINK < 1.0:
+            head_importance = 1.0 + _V_ATTENTION_IMPORTANCE_SHRINK * (
+                head_importance - 1.0
+            )
+        v_importance = _normalize_importance(
+            head_importance.repeat_interleave(head_dim).reshape(-1),
+            kv_channels,
+        )
 
     q_second_moment = q_sum_square / float(max(q_token_count, 1))
     k_second_moment = k_sum_square / float(max(k_token_count, 1))
@@ -1691,7 +1749,7 @@ def hif4_calibration_attention(
         )
         v_ratio = _loss_capture_ratio(
             torch.cat(
-                [_standard_block_losses(s, None) for s in v_samples]
+                [_standard_block_losses(s, v_importance) for s in v_samples]
             ),
             target=_RATIO_CAPTURE_TARGET,
             ratio_min=_RATIO_MIN,
@@ -1745,6 +1803,11 @@ def hif4_calibration_attention(
     }
     v_state = {
         "offsets": torch.tensor(_DYNAMIC_OFFSETS, dtype=torch.int8, device="cpu"),
+        "importance": (
+            None
+            if v_importance is None
+            else _cpu_state_tensor(v_importance)
+        ),
         "error_threshold": _ATTN_REFINE_ERROR_THRESHOLD,
         "accept_margin": _V_REFINE_ACCEPT_MARGIN,
         "max_refine_ratio": float(v_ratio),
@@ -1838,6 +1901,7 @@ def hif4_dynamic_quantize_v(
     return _nvfp4_to_hif4(
         v_quant,
         v_scale,
+        importance=state["importance"],
         search_offsets=state["offsets"],
         error_threshold=float(state["error_threshold"]),
         accept_margin=float(state["accept_margin"]),

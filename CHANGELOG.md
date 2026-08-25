@@ -1,5 +1,28 @@
 # 版本记录
 
+## v1.5 — V 的 head 级注意力概率加权重要性（attn +0.0010）
+
+### 动机
+
+V 量化此前没有任何重要性：`v_state` 只有 offsets 和 refine 比例。
+但 V 的误差进入 softmax 输出时被注意力权重 A 放大，输出 MSE 的静态
+权重近似为 `E[A^2]`。head_dim=64 时一个 HiF4 64 块恰好是一个 KV head
+的一条位置切片，按 head 加权可直接作用到块上。与 Q/K 协方差不同，
+这是静态概率统计（因果 softmax 的平方平均），不存在少量 token 过拟合。
+
+### 改动
+
+`_V_ATTENTION_IMPORTANCE`：校准期统计每个 KV head 的 `E[A^2]`
+（GQA 取组内 Q head 平均），均值归一化后作为 V 的通道重要性，
+同时用于 refine 预算的损失统计与块级 scale 搜索。默认完全加权
+（`_V_ATTENTION_IMPORTANCE_SHRINK = 1.0`）；实测收缩到 0.5 反而
+稀释收益（+0.0002 vs +0.0010）。
+
+### 实测（amax6，GPT-2 12 层）
+
+相对 v1.4：attn 0.3746→0.3756（+0.0010），其余 7 项不变；
+校准 +约 0.4s/12 层。
+
 ## v1.4 — 置换基扩展（weight-only / activation-only 排序候选）
 
 ### 大视角诊断

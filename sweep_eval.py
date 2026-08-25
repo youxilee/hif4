@@ -52,6 +52,8 @@ def make_configs() -> list[tuple[str, dict]]:
         "_WEIGHT_QUADRATIC": True,
         "_ACTIVATION_QUADRATIC": True,
         "_PERMUTATION_BASES": True,
+        "_V_ATTENTION_IMPORTANCE": True,
+        "_V_ATTENTION_IMPORTANCE_SHRINK": 1.0,
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
         "_Q_REFINE_MAX_RATIO": 0.60,
         "_K_REFINE_MAX_RATIO": 0.70,
@@ -70,6 +72,8 @@ def make_configs() -> list[tuple[str, dict]]:
         ("no_quad", {**best, "_WEIGHT_QUADRATIC": False}),
         ("no_act_quad", {**best, "_ACTIVATION_QUADRATIC": False}),
         ("no_perm_bases", {**best, "_PERMUTATION_BASES": False}),
+        ("no_v_imp", {**best, "_V_ATTENTION_IMPORTANCE": False}),
+        ("v_imp_shrink", {**best, "_V_ATTENTION_IMPORTANCE_SHRINK": 0.5}),
     ]
 
 
@@ -100,6 +104,8 @@ def apply_config(overrides: dict) -> None:
         "_WEIGHT_QUADRATIC": False,
         "_ACTIVATION_QUADRATIC": False,
         "_PERMUTATION_BASES": False,
+        "_V_ATTENTION_IMPORTANCE": False,
+        "_V_ATTENTION_IMPORTANCE_SHRINK": 1.0,
         "_RATIO_CAPTURE_TARGET": 0.95,
         "_RATIO_MIN": 0.10,
         "_LINEAR_EVAL_TOKENS": 128,
