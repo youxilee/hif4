@@ -51,6 +51,7 @@ def make_configs() -> list[tuple[str, dict]]:
         "_RATIO_CAPTURE_TARGET": 0.99,
         "_WEIGHT_QUADRATIC": True,
         "_ACTIVATION_QUADRATIC": True,
+        "_PERMUTATION_BASES": True,
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
         "_Q_REFINE_MAX_RATIO": 0.60,
         "_K_REFINE_MAX_RATIO": 0.70,
@@ -68,6 +69,7 @@ def make_configs() -> list[tuple[str, dict]]:
         ("old", old),                      # 代码改动前的行为
         ("no_quad", {**best, "_WEIGHT_QUADRATIC": False}),
         ("no_act_quad", {**best, "_ACTIVATION_QUADRATIC": False}),
+        ("no_perm_bases", {**best, "_PERMUTATION_BASES": False}),
     ]
 
 
@@ -97,6 +99,7 @@ def apply_config(overrides: dict) -> None:
         "_DATA_DRIVEN_RATIO": False,
         "_WEIGHT_QUADRATIC": False,
         "_ACTIVATION_QUADRATIC": False,
+        "_PERMUTATION_BASES": False,
         "_RATIO_CAPTURE_TARGET": 0.95,
         "_RATIO_MIN": 0.10,
         "_LINEAR_EVAL_TOKENS": 128,
@@ -208,7 +211,7 @@ def main() -> int:
             attn.append(
                 score_attention(
                     enc["test_qkv"][i], att_state["q_state"],
-                    att_state["k_state"], att_state["v_state"], qh, hd,
+                    att_state["k_state"], att_state["v_state"], qh, qh, hd,
                 )
             )
         row = {"cfg": cfg_name, "time": time.time() - tc}

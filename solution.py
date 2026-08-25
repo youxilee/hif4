@@ -120,6 +120,14 @@ _ACTIVATION_QUADRATIC = True
 # diagonal importance automatically.
 _ACTIVATION_QUADRATIC_MAX_FEATURES = 1024
 
+# Permutation search bases.  The initial hierarchy-aware ordering combines the
+# paired operands via max(log range); real-data diagnostics show the operand
+# with the larger quantization burden (usually the weight/K side) often yields
+# a better single-sided ordering.  Each basis is evaluated with the exact
+# paired metric and accepted only when it clears the same safety gate as the
+# smoothing candidates.
+_PERMUTATION_BASES = True
+
 
 def dequantize_nvfp4(
     quant_float: torch.Tensor,
@@ -310,6 +318,30 @@ def _hierarchy_aware_permutation(
     if float(pressure.max() - pressure.min()) < 0.25:
         return _identity_permutation(int(pressure.numel()), pressure.device)
     return torch.argsort(pressure, descending=True)
+
+
+def _range_permutation(ranges: torch.Tensor) -> torch.Tensor:
+    """1D argsort of log ranges; identity when the log spread is negligible."""
+
+    log_r = torch.log2(ranges.to(torch.float32).clamp_min(_EPS))
+    log_r = log_r - torch.median(log_r)
+    flat = log_r.reshape(-1)
+    if float(flat.max() - flat.min()) < 0.25:
+        return _identity_permutation(int(flat.numel()), flat.device)
+    return torch.argsort(flat, descending=True)
+
+
+def _headwise_range_permutation(ranges: torch.Tensor) -> torch.Tensor:
+    """Per-head argsort of log ranges (ranges: [heads, head_dim])."""
+
+    log_r = torch.log2(ranges.to(torch.float32).clamp_min(_EPS))
+    log_r = log_r - log_r.median(dim=-1, keepdim=True).values
+    spread = log_r.amax(dim=-1) - log_r.amin(dim=-1)
+    identity = torch.arange(
+        int(ranges.shape[-1]), dtype=torch.int64, device=ranges.device
+    ).expand_as(ranges)
+    ordered = torch.argsort(log_r, dim=-1, descending=True)
+    return torch.where(spread[:, None] >= 0.25, ordered, identity)
 
 
 def _headwise_hierarchy_permutation(
@@ -1104,6 +1136,42 @@ def hif4_calibration_and_quantize_weight(
                 best_d = candidate_d
                 best_perm = candidate_perm
 
+    # 置换基扩展：同一平滑 d 下比较 weight-only / activation-only 排序，
+    # 诊断显示单侧排序常优于 max(log range) 组合排序。
+    if _PERMUTATION_BASES:
+        basis_ranges = {
+            "w_amax": weight_amax * best_d,
+            "x_amax": activation_amax / best_d,
+            "w_rms": weight_rms * best_d,
+            "x_rms": activation_rms / best_d,
+        }
+        seen = {tuple(best_perm.tolist())}
+        for bname, b_range in basis_ranges.items():
+            b_perm = _range_permutation(b_range)
+            if torch.equal(b_perm, identity_perm):
+                continue
+            if tuple(b_perm.tolist()) in seen:
+                continue
+            seen.add(tuple(b_perm.tolist()))
+            b_metrics = _linear_candidate_metrics(
+                weight_sample,
+                activation_second_moment,
+                activation_samples,
+                best_d,
+                b_perm,
+            )
+            if (
+                b_metrics[0] < best_metrics[0]
+                and _candidate_is_safe(
+                    b_metrics,
+                    baseline_metrics,
+                    min_mean_improvement=0.02,
+                    worst_tolerance=0.005,
+                )
+            ):
+                best_metrics = b_metrics
+                best_perm = b_perm
+
     weight_smooth = (weight * best_d.unsqueeze(0)).index_select(
         -1, best_perm
     )
@@ -1525,6 +1593,50 @@ def hif4_calibration_attention(
             best_metrics = permutation_metrics
             best_q_perm = candidate_q_perm
             best_k_perm = candidate_k_perm
+
+    # 置换基扩展：单侧排序（Q-only / K-only）常优于 max(log range) 组合。
+    if _PERMUTATION_BASES:
+        basis_ranges = {
+            "q_amax": q_peak_kv * best_d,
+            "k_amax": selected_k_peak * best_d.reciprocal(),
+        }
+        seen = {tuple(best_k_perm.tolist())}
+        for bname, b_range in basis_ranges.items():
+            b_local = _headwise_range_permutation(b_range)
+            b_k_perm = _flatten_head_permutation(b_local)
+            if torch.equal(b_k_perm, k_identity_perm):
+                continue
+            if tuple(b_k_perm.tolist()) in seen:
+                continue
+            seen.add(tuple(b_k_perm.tolist()))
+            b_q_perm = _flatten_head_permutation(
+                b_local.repeat_interleave(group_size, dim=0)
+            )
+            b_metrics = _attention_candidate_metrics(
+                q_samples,
+                k_samples,
+                best_d,
+                q_second_moment,
+                selected_k_second,
+                q_num_heads,
+                kv_num_heads,
+                head_dim,
+                b_q_perm,
+                b_k_perm,
+                best_center_mode,
+            )
+            if (
+                b_metrics[0] < best_metrics[0]
+                and _candidate_is_safe(
+                    b_metrics,
+                    baseline_metrics,
+                    min_mean_improvement=0.02,
+                    worst_tolerance=0.005,
+                )
+            ):
+                best_metrics = b_metrics
+                best_q_perm = b_q_perm
+                best_k_perm = b_k_perm
 
     d_q = best_d.repeat_interleave(group_size, dim=0)
     d_k = best_d.reciprocal()

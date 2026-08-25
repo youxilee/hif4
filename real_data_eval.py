@@ -112,6 +112,7 @@ def set_config(kind: str) -> None:
         s._DATA_DRIVEN_RATIO = False
         s._WEIGHT_QUADRATIC = False
         s._ACTIVATION_QUADRATIC = False
+        s._PERMUTATION_BASES = False
         s._ATTN_CENTER_MODES = (0, 2)
     else:
         s._WEIGHT_OFFSETS = (-2, -1, 1, 2, 3)
@@ -130,6 +131,7 @@ def set_config(kind: str) -> None:
         s._DATA_DRIVEN_RATIO = True
         s._WEIGHT_QUADRATIC = True
         s._ACTIVATION_QUADRATIC = True
+        s._PERMUTATION_BASES = True
         s._ATTN_CENTER_MODES = (0, 2)
 
 

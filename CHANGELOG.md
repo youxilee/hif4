@@ -1,5 +1,27 @@
 # 版本记录
 
+## v1.4 — 置换基扩展（weight-only / activation-only 排序候选）
+
+### 大视角诊断
+
+真实 GPT-2 数据上对 9 种排列基做候选度量对比，发现 `max(log range)`
+组合排序并非最优：Linear 的 fc/proj 用 weight 侧排序（w_amax/w_rms）
+代理误差低 5~9%，o 层甚至 identity 优于组合排序；Attention 的 K 侧
+单边排序优于组合排序。块的 scale 搜索已饱和，但"哪些通道进同一个
+64 块"仍有结构空间。
+
+### 改动
+
+`_PERMUTATION_BASES`：在选定的平滑 d 下，把 w_amax / x_amax / w_rms /
+x_rms（Linear）与 q_amax / k_amax（Attention，逐 head）加入置换候选，
+用与平滑候选相同的安全性门槛（均值 +2%、最坏 +0.5%）择优。
+
+### 实测（amax6，GPT-2 12 层）
+
+相对 v1.3：q +0.0009、v +0.0007、o +0.0002、k +0.0001，
+fc/proj/attn 不变；校准 +约 140ms/层。完整贪心交换搜索未实施：
+实测天花板（最终得分口径）只有 ~0.001，投入产出比不足。
+
 ## v1.3 — 动态激活的满 Gram 二次型加权（commit 4ee95c7）
 
 ### 大视角诊断
