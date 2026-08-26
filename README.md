@@ -11,12 +11,7 @@
 | `solution.py` | 比赛提交主体：HiF4 校准与动态量化全部实现（唯一需要提交的文件） |
 | `nvfp4_sim.py` | 权威 NVFP4 模拟器：E4M3 向上取整 scale + E2M1 就近取偶 carrier（cuDNN 官方配方） |
 | `real_data_eval.py` | 真实 GPT-2 端到端评测：按比赛口径输出 Linear / Attention 得分 |
-| `e2e_eval.py` | 小型 Transformer 端到端冒烟评测（logits 误差 + top1） |
-| `sweep_eval.py` | 参数/算法开关扫描：真实数据只加载编码一次，逐配置重跑校准+打分 |
-| `shape_smoke.py` | 非 GPT-2 几何冒烟：head_dim 128 + GQA、宽 Linear（1536/6144 通道） |
-| `time_breakdown.py` | 校准 vs 每样本动态量化耗时拆解，用于 5 分钟预算评估 |
 | `test_solution.py` | 离线回归测试：确定性、合法性、重建误差 |
-| `block_smooth_probe.py` | 块正交 SmoothQuant 探针：隔离比较 identity 与 H4/H8/H16 |
 
 ## 运行方式
 
@@ -26,9 +21,6 @@
 
 # 真实 GPT-2 评测（original vs current）
 /opt/anaconda3/bin/python3 real_data_eval.py --mode amax6 --config both
-
-# 配置扫描
-/opt/anaconda3/bin/python3 sweep_eval.py --layers 12
 ```
 
 ## 运行与评估的最小要求
@@ -45,8 +37,7 @@
 | --- | --- | --- | --- |
 | 提交主体 | `solution.py`、`nvfp4_sim.py` | 仅 torch | — |
 | 离线自测 | `test_solution.py` | 仅 torch，无网络 | ~4 秒 |
-| 冒烟评测 | `e2e_eval.py` | 仅 torch | — |
-| GPT-2 评估 | `real_data_eval.py`、`sweep_eval.py`、`shape_smoke.py`、`block_smooth_probe.py`、`time_breakdown.py` | torch + transformers + 本地 GPT-2 | 小配置 ~14 秒；默认 12 层配置按 5 分钟预算设计 |
+| GPT-2 评估 | `real_data_eval.py` | torch + transformers + 本地 GPT-2 | 小配置 ~14 秒；默认 12 层配置按 5 分钟预算设计 |
 
 **GPT-2 本地模型目录 `/private/tmp/gpt2/`**
 
