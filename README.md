@@ -16,6 +16,7 @@
 | `shape_smoke.py` | 非 GPT-2 几何冒烟：head_dim 128 + GQA、宽 Linear（1536/6144 通道） |
 | `time_breakdown.py` | 校准 vs 每样本动态量化耗时拆解，用于 5 分钟预算评估 |
 | `test_solution.py` | 离线回归测试：确定性、合法性、重建误差 |
+| `block_smooth_probe.py` | 块正交 SmoothQuant 探针：隔离比较 identity 与 H4/H8/H16 |
 
 ## 运行方式
 

@@ -1,9 +1,9 @@
 """HiF4 solution for the 2026 Huawei algorithm competition.
 
 The implementation keeps the official HiF4 conversion as an explicit fallback,
-selects calibration-gated equivalent scaling/reordering transforms, and applies
-bounded scale/hierarchy refinement to difficult blocks. All calibration states
-are plain CPU data.
+selects calibration-gated equivalent scaling/reordering/block-matrix transforms,
+and applies bounded scale/hierarchy refinement to difficult blocks. All
+calibration states are plain CPU data.
 """
 
 from __future__ import annotations
@@ -38,6 +38,20 @@ _WEIGHT_SMOOTH_ALPHAS = (0.25, 0.50, 0.75)
 # 窄层（q/k/v/o，768）细网格反而过拟合（-0.0003~-0.0021），保持 3 档。
 _WEIGHT_SMOOTH_ALPHAS_WIDE = (0.25, 0.375, 0.50, 0.625, 0.75)
 _WIDE_LAYER_MIN_DIM = 2048
+# Matrix SmoothQuant candidates.  After the diagonal scale and optional
+# permutation, apply the same orthogonal block transform to X and W.  In the
+# usual X @ W convention this is a block-diagonal S on X and S^{-1} on W;
+# orthogonality makes S^{-1}=S^T, so the row-major weight carrier can use the
+# same right transform.  Only the winning block size enters dynamic state.
+_BLOCK_SMOOTH_ALLOWED_SIZES = (4, 8, 16)
+_BLOCK_SMOOTH_SIZES = _BLOCK_SMOOTH_ALLOWED_SIZES
+_BLOCK_SMOOTH_SEEDS = (0, 1, 2, 3)
+# Evaluation-only override used by the sweep harness.  Zero keeps the guarded
+# production behavior; 4/8/16 forces that size while still choosing its best
+# deterministic sign seed on calibration data.
+_BLOCK_SMOOTH_FORCE_SIZE = 0
+_BLOCK_SMOOTH_MIN_IMPROVEMENT = 0.005
+_BLOCK_SMOOTH_WORST_TOLERANCE = 0.005
 _WEIGHT_REFINE_ERROR_THRESHOLD = 1.0e-7
 _WEIGHT_REFINE_ACCEPT_MARGIN = 0.005
 _WEIGHT_REFINE_MAX_RATIO_SMALL = 1.0
@@ -103,7 +117,10 @@ _REFINE_EDGE_EXTEND_STEPS = 2
 # calibration estimates the block-loss distribution and stores the smallest
 # refine fraction that captures a target share of the total weighted loss.
 _DATA_DRIVEN_RATIO = True
-_RATIO_CAPTURE_TARGET = 0.99
+# 时间预算允许放宽后，把损失覆盖目标从 0.99 提到 0.999：实际 refine
+# 比例从 ~0.95 提到 ~0.99（几乎全量），8 批测试上 7 类得分全部为正
+# （attn +0.0018，其余 +0.0001~0.0003），动态耗时 +约 5%。
+_RATIO_CAPTURE_TARGET = 0.999
 _RATIO_MIN = 0.10
 
 # Weight quantization can use the full per-block activation covariance as a
@@ -952,6 +969,8 @@ def _nvfp4_to_hif4(
     *,
     multiplier: Optional[torch.Tensor] = None,
     permutation: Optional[torch.Tensor] = None,
+    block_smooth_size: int = 0,
+    block_smooth_seed: int = 0,
     center_mode: int = 0,
     center_num_heads: Optional[int] = None,
     center_head_dim: Optional[int] = None,
@@ -984,6 +1003,10 @@ def _nvfp4_to_hif4(
         if int(order.numel()) != channels:
             raise ValueError("Permutation width does not match tensor width")
         dense = dense.index_select(-1, order)
+    if int(block_smooth_size) != 0:
+        dense = _block_hadamard_transform(
+            dense, int(block_smooth_size), int(block_smooth_seed)
+        )
     gram = None
     if group_gram is not None:
         gram = group_gram.detach().to(
@@ -1042,12 +1065,129 @@ def _smooth_scale(
     )
 
 
+def _hadamard_matrix(
+    size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Return a normalized Sylvester Hadamard matrix (size 4/8/16)."""
+
+    n = int(size)
+    if n not in _BLOCK_SMOOTH_ALLOWED_SIZES:
+        raise ValueError(
+            "block_smooth_size must be one of "
+            f"{_BLOCK_SMOOTH_ALLOWED_SIZES}, got {n}"
+        )
+    h = torch.ones(1, 1, dtype=dtype, device=device)
+    while int(h.shape[0]) < n:
+        h = torch.cat(
+            (torch.cat((h, h), dim=1), torch.cat((h, -h), dim=1)), dim=0
+        )
+    return h * (1.0 / math.sqrt(float(n)))
+
+
+def _block_hadamard_transform(
+    dense: torch.Tensor,
+    block_size: int,
+    seed: int = 0,
+) -> torch.Tensor:
+    """Apply a deterministic signed orthogonal transform to feature blocks.
+
+    The signs avoid concentrating positively correlated channels in the DC
+    Hadamard coefficient.  They are derived from the absolute feature index,
+    so calibration and dynamic quantization only share ``block_size`` and a
+    small integer ``seed``.
+    """
+
+    size = int(block_size)
+    if size == 0:
+        return dense
+    channels = int(dense.shape[-1])
+    if channels % size != 0:
+        raise ValueError(
+            f"Feature width {channels} is not divisible by block size {size}"
+        )
+    indices = torch.arange(channels, dtype=torch.int64, device=dense.device)
+    bits = (
+        indices * 1_103_515_245 + int(seed) * 214_013 + 12_345
+    ).bitwise_and(1 << 30)
+    signs = torch.where(bits == 0, 1.0, -1.0).to(dtype=dense.dtype)
+    grouped = dense.reshape(*dense.shape[:-1], channels // size, size)
+    grouped = grouped * signs.reshape(channels // size, size)
+    h = _hadamard_matrix(size, dense.device, dense.dtype)
+    return torch.matmul(grouped, h).reshape_as(dense)
+
+
+def _linear_pair_transform(
+    dense: torch.Tensor,
+    d: torch.Tensor,
+    permutation: torch.Tensor,
+    block_smooth_size: int,
+    block_smooth_seed: int = 0,
+    *,
+    weight_side: bool,
+) -> torch.Tensor:
+    """Apply one side of the exactly equivalent Linear transform."""
+
+    scale = d if weight_side else d.reciprocal()
+    transformed = (dense * scale.unsqueeze(0)).index_select(-1, permutation)
+    return _block_hadamard_transform(
+        transformed, block_smooth_size, block_smooth_seed
+    )
+
+
+def _transformed_second_moment(
+    second_moment: torch.Tensor,
+    d: torch.Tensor,
+    permutation: torch.Tensor,
+    block_smooth_size: int,
+    block_smooth_seed: int = 0,
+) -> torch.Tensor:
+    """Diagonal covariance after scale/permutation/block rotation.
+
+    Without a full covariance the diagonal after a normalized Hadamard is the
+    mean variance of each block.  The full covariance path below is still used
+    for the quadratic weight solver once a candidate has been selected.
+    """
+
+    moment = (second_moment / d.square()).index_select(0, permutation)
+    size = int(block_smooth_size)
+    if size != 0:
+        moment = moment.reshape(-1, size).mean(dim=-1, keepdim=True).expand(
+            -1, size
+        ).reshape(-1)
+    return moment
+
+
+def _transformed_covariance(
+    covariance: torch.Tensor,
+    d: torch.Tensor,
+    permutation: torch.Tensor,
+    block_smooth_size: int,
+    block_smooth_seed: int = 0,
+) -> torch.Tensor:
+    """Full activation covariance after the equivalent transform."""
+
+    scale = d.reciprocal().to(dtype=covariance.dtype)
+    cov = covariance * scale.unsqueeze(0) * scale.unsqueeze(1)
+    cov = cov.index_select(0, permutation).index_select(1, permutation)
+    size = int(block_smooth_size)
+    if size != 0:
+        cov = _block_hadamard_transform(cov, size, block_smooth_seed)
+        cov = _block_hadamard_transform(
+            cov.t(), size, block_smooth_seed
+        ).t()
+    return cov
+
+
 def _linear_candidate_metrics(
     weight: torch.Tensor,
     activation_second_moment: torch.Tensor,
     activation_samples: Sequence[torch.Tensor],
     d: torch.Tensor,
     permutation: torch.Tensor,
+    block_smooth_size: int = 0,
+    block_smooth_seed: int = 0,
 ) -> tuple[float, tuple[float, ...]]:
     """Score an equivalent Linear transform from operand-side statistics."""
 
@@ -1056,8 +1196,17 @@ def _linear_candidate_metrics(
     if int(order.numel()) != channels:
         raise ValueError("Linear candidate permutation has an invalid width")
 
-    weight_smooth = (weight * d.unsqueeze(0)).index_select(-1, order)
-    h_x = (activation_second_moment / d.square()).index_select(0, order)
+    weight_smooth = _linear_pair_transform(
+        weight,
+        d,
+        order,
+        block_smooth_size,
+        block_smooth_seed,
+        weight_side=True,
+    )
+    h_x = _transformed_second_moment(
+        activation_second_moment, d, order, block_smooth_size
+    )
     weight_params = _dense_to_hif4(weight_smooth)
     weight_hat = _dequantize_hif4(weight_params)
 
@@ -1073,7 +1222,14 @@ def _linear_candidate_metrics(
 
     case_scores: list[float] = []
     for sample in activation_samples:
-        smooth = (sample / d.unsqueeze(0)).index_select(-1, order)
+        smooth = _linear_pair_transform(
+            sample,
+            d,
+            order,
+            block_smooth_size,
+            block_smooth_seed,
+            weight_side=False,
+        )
         params = _dense_to_hif4(smooth)
         reconstructed = _dequantize_hif4(params)
         error = ((smooth - reconstructed).square() * h_w.unsqueeze(0)).sum()
@@ -1090,6 +1246,62 @@ def _linear_candidate_metrics(
         case_scores.append(float(torch.nan_to_num(weight_score, nan=1.0e30)))
     mean_score = sum(case_scores) / float(len(case_scores))
     return mean_score, tuple(case_scores)
+
+
+def _linear_output_candidate_metrics(
+    weight: torch.Tensor,
+    activation_samples: Sequence[torch.Tensor],
+    d: torch.Tensor,
+    permutation: torch.Tensor,
+    block_smooth_size: int = 0,
+    block_smooth_seed: int = 0,
+) -> tuple[float, tuple[float, ...]]:
+    """Score a transform by the actual sampled Linear output error.
+
+    Operand-local reconstruction error is a useful cheap proxy for diagonal
+    smoothing, but it misses cancellation between activation and weight errors
+    after a non-diagonal transform.  Block-S candidates therefore use the
+    end-to-end sampled objective that the competition ultimately measures.
+    """
+
+    order = permutation.to(device=weight.device, dtype=torch.int64).reshape(-1)
+    weight_transformed = _linear_pair_transform(
+        weight,
+        d,
+        order,
+        block_smooth_size,
+        block_smooth_seed,
+        weight_side=True,
+    )
+    weight_hat = _dequantize_hif4(_dense_to_hif4(weight_transformed))
+    case_scores: list[float] = []
+    for sample in activation_samples:
+        activation_transformed = _linear_pair_transform(
+            sample,
+            d,
+            order,
+            block_smooth_size,
+            block_smooth_seed,
+            weight_side=False,
+        )
+        activation_hat = _dequantize_hif4(
+            _dense_to_hif4(activation_transformed)
+        )
+        reference = activation_transformed.mm(weight_transformed.t())
+        reconstructed = activation_hat.mm(weight_hat.t())
+        score = (reference - reconstructed).square().sum() / (
+            reference.square().sum() + _EPS
+        )
+        case_scores.append(
+            float(
+                torch.nan_to_num(
+                    score, nan=1.0e30, posinf=1.0e30, neginf=1.0e30
+                )
+            )
+        )
+    if not case_scores:
+        return 1.0e30, (1.0e30,)
+    return sum(case_scores) / float(len(case_scores)), tuple(case_scores)
 
 
 def _cpu_state_tensor(x: torch.Tensor) -> torch.Tensor:
@@ -1190,6 +1402,8 @@ def hif4_calibration_and_quantize_weight(
     best_metrics = baseline_metrics
     best_d = identity_d
     best_perm = identity_perm
+    best_block_smooth_size = 0
+    best_block_smooth_seed = 0
 
     for candidate_index, candidate_d in enumerate(smooth_candidates):
         candidate_permutations = [identity_perm]
@@ -1260,18 +1474,82 @@ def hif4_calibration_and_quantize_weight(
                 best_metrics = b_metrics
                 best_perm = b_perm
 
-    weight_smooth = (weight * best_d.unsqueeze(0)).index_select(
-        -1, best_perm
+    # Matrix SmoothQuant extension: within the channel groups selected above,
+    # try non-diagonal block transforms of size 4/8/16.  The transform is a
+    # deterministic signed Hadamard, hence exactly orthogonal and represented
+    # in dynamic state by two small integers rather than a dense matrix.
+    force_block_size = int(_BLOCK_SMOOTH_FORCE_SIZE)
+    candidate_block_sizes = (
+        (force_block_size,) if force_block_size else _BLOCK_SMOOTH_SIZES
     )
-    h_x_smooth = (activation_second_moment / best_d.square()).index_select(
-        0, best_perm
+    forced_choice: Optional[tuple[tuple[float, tuple[float, ...]], int, int]] = None
+    block_baseline_metrics = _linear_output_candidate_metrics(
+        weight_sample,
+        activation_samples,
+        best_d,
+        best_perm,
+    )
+    block_best_metrics = block_baseline_metrics
+    if candidate_block_sizes:
+        for candidate_size in candidate_block_sizes:
+            size = int(candidate_size)
+            if size <= 0 or in_features % size != 0:
+                continue
+            for candidate_seed in _BLOCK_SMOOTH_SEEDS:
+                seed = int(candidate_seed)
+                block_metrics = _linear_output_candidate_metrics(
+                    weight_sample,
+                    activation_samples,
+                    best_d,
+                    best_perm,
+                    size,
+                    seed,
+                )
+                if force_block_size:
+                    if (
+                        forced_choice is None
+                        or block_metrics[0] < forced_choice[0][0]
+                    ):
+                        forced_choice = (block_metrics, size, seed)
+                    continue
+                if (
+                    block_metrics[0] < block_best_metrics[0]
+                    and _candidate_is_safe(
+                        block_metrics,
+                        block_baseline_metrics,
+                        min_mean_improvement=_BLOCK_SMOOTH_MIN_IMPROVEMENT,
+                        worst_tolerance=_BLOCK_SMOOTH_WORST_TOLERANCE,
+                    )
+                ):
+                    block_best_metrics = block_metrics
+                    best_block_smooth_size = size
+                    best_block_smooth_seed = seed
+    if forced_choice is not None:
+        _, best_block_smooth_size, best_block_smooth_seed = forced_choice
+
+    weight_smooth = _linear_pair_transform(
+        weight,
+        best_d,
+        best_perm,
+        best_block_smooth_size,
+        best_block_smooth_seed,
+        weight_side=True,
+    )
+    h_x_smooth = _transformed_second_moment(
+        activation_second_moment,
+        best_d,
+        best_perm,
+        best_block_smooth_size,
     )
     weight_group_gram = None
     if use_quadratic:
-        gram = cov_sum / float(max(token_count, 1))
-        d = best_d.to(gram.dtype)
-        gram = gram / d.unsqueeze(0) / d.unsqueeze(1)
-        gram = gram.index_select(0, best_perm).index_select(1, best_perm)
+        gram = _transformed_covariance(
+            cov_sum / float(max(token_count, 1)),
+            best_d,
+            best_perm,
+            best_block_smooth_size,
+            best_block_smooth_seed,
+        )
         blocks = in_features // _HIF4_BLOCK_SIZE
         weight_group_gram = _flat_group_gram(gram, in_features).reshape(
             blocks, 8, 2, 4, 4
@@ -1317,6 +1595,12 @@ def hif4_calibration_and_quantize_weight(
                 transformed = transformed * smooth_inv_state.reshape(1, -1)
             if permutation_state is not None:
                 transformed = transformed.index_select(-1, permutation_state)
+            if best_block_smooth_size != 0:
+                transformed = _block_hadamard_transform(
+                    transformed,
+                    best_block_smooth_size,
+                    best_block_smooth_seed,
+                )
             loss_parts.append(
                 _standard_block_losses(transformed, activation_importance)
             )
@@ -1341,6 +1625,8 @@ def hif4_calibration_and_quantize_weight(
     activation_state = {
         "smooth_inv": smooth_inv_state,
         "permutation": permutation_state,
+        "block_smooth_size": int(best_block_smooth_size),
+        "block_smooth_seed": int(best_block_smooth_seed),
         "importance": _cpu_state_tensor(activation_importance),
         "gram": activation_gram_state,
         "offsets": torch.tensor(_DYNAMIC_OFFSETS, dtype=torch.int8, device="cpu"),
@@ -1349,7 +1635,7 @@ def hif4_calibration_and_quantize_weight(
         "max_refine_ratio": float(activation_ratio),
         "max_refine_blocks": _ACTIVATION_REFINE_MAX_BLOCKS,
         "in_features": int(in_features),
-        "version": 2,
+        "version": 3,
     }
     return {
         "weight_params": weight_params,
@@ -1373,6 +1659,8 @@ def hif4_dynamic_quantize_activation(
         activation_scale,
         multiplier=activation_state["smooth_inv"],
         permutation=activation_state["permutation"],
+        block_smooth_size=int(activation_state.get("block_smooth_size", 0)),
+        block_smooth_seed=int(activation_state.get("block_smooth_seed", 0)),
         importance=activation_state["importance"],
         group_gram=activation_state.get("gram"),
         search_offsets=activation_state["offsets"],

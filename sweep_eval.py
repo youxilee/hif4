@@ -48,7 +48,7 @@ def make_configs() -> list[tuple[str, dict]]:
         "_ATTN_CENTER_MODES": (0, 2),
         "_REFINE_EDGE_EXTENSION": True,
         "_DATA_DRIVEN_RATIO": True,
-        "_RATIO_CAPTURE_TARGET": 0.99,
+        "_RATIO_CAPTURE_TARGET": 0.999,
         "_WEIGHT_QUADRATIC": True,
         "_ACTIVATION_QUADRATIC": True,
         "_PERMUTATION_BASES": True,
@@ -57,6 +57,8 @@ def make_configs() -> list[tuple[str, dict]]:
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50, 0.75),
         "_WEIGHT_SMOOTH_ALPHAS_WIDE": (0.25, 0.375, 0.50, 0.625, 0.75),
         "_WIDE_LAYER_MIN_DIM": 2048,
+        "_BLOCK_SMOOTH_SIZES": (4, 8, 16),
+        "_BLOCK_SMOOTH_FORCE_SIZE": 0,
         "_Q_REFINE_MAX_RATIO": 0.60,
         "_K_REFINE_MAX_RATIO": 0.70,
         "_V_REFINE_MAX_RATIO": 0.60,
@@ -82,6 +84,14 @@ def make_configs() -> list[tuple[str, dict]]:
         ("no_wide_alphas", {
             **best, "_WEIGHT_SMOOTH_ALPHAS_WIDE": (0.25, 0.50, 0.75),
         }),
+        ("no_block_smooth", {**best, "_BLOCK_SMOOTH_SIZES": ()}),
+        ("guarded_block4", {
+            **best, "_BLOCK_SMOOTH_SIZES": (4,), "_BLOCK_SMOOTH_FORCE_SIZE": 0,
+        }),
+        ("force_block4", {**best, "_BLOCK_SMOOTH_FORCE_SIZE": 4}),
+        ("force_block8", {**best, "_BLOCK_SMOOTH_FORCE_SIZE": 8}),
+        ("force_block16", {**best, "_BLOCK_SMOOTH_FORCE_SIZE": 16}),
+        ("edge3", {**best, "_REFINE_EDGE_EXTEND_STEPS": 3}),
     ]
 
 
@@ -105,6 +115,8 @@ def apply_config(overrides: dict) -> None:
         "_WEIGHT_SMOOTH_ALPHAS": (0.25, 0.50),
         "_WEIGHT_SMOOTH_ALPHAS_WIDE": (0.25, 0.50, 0.75),
         "_WIDE_LAYER_MIN_DIM": 2048,
+        "_BLOCK_SMOOTH_SIZES": (),
+        "_BLOCK_SMOOTH_FORCE_SIZE": 0,
         "_WEIGHT_SMOOTH_RMS": False,
         "_QK_SMOOTH_RMS": False,
         "_REFINE_RANK_BY_ABSOLUTE": False,
@@ -209,6 +221,7 @@ def main() -> int:
         apply_config(overrides)
         tc = time.time()
         lin = {name: [] for name in names}
+        block_choices = {name: [] for name in names}
         attn = []
         for i in range(L):
             for name in names:
@@ -220,6 +233,9 @@ def main() -> int:
                         enc["w"][i][name], enc["test_act"][i][name],
                         res["activation_state"], res["weight_params"],
                     )
+                )
+                block_choices[name].append(
+                    int(res["activation_state"].get("block_smooth_size", 0))
                 )
             att_state = s.hif4_calibration_attention(
                 enc["calib_qkv"][i], qh, qh, hd
@@ -237,6 +253,9 @@ def main() -> int:
         rows.append(row)
         print(f"[{cfg_name}] {time.time()-tc:.1f}s  " + "  ".join(
             f"{k}={v:.4f}" for k, v in row.items() if k not in ("cfg", "time")
+        ), flush=True)
+        print("  block choices  " + "  ".join(
+            f"{name}={block_choices[name]}" for name in names
         ), flush=True)
 
     base = next(r for r in rows if r["cfg"] == "best")

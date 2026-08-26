@@ -55,6 +55,8 @@ def apply_state_transform(
     *,
     multiplier: torch.Tensor | None = None,
     permutation: torch.Tensor | None = None,
+    block_smooth_size: int = 0,
+    block_smooth_seed: int = 0,
     center_mode: int = 0,
     heads: int | None = None,
     head_dim: int | None = None,
@@ -67,6 +69,10 @@ def apply_state_transform(
         x = x * multiplier.reshape(1, -1)
     if permutation is not None:
         x = x.index_select(-1, permutation)
+    if block_smooth_size:
+        x = s._block_hadamard_transform(
+            x, block_smooth_size, block_smooth_seed
+        )
     return x
 
 
@@ -93,6 +99,29 @@ def test_dequantize_nvfp4() -> None:
     print("dequantize_nvfp4              OK")
 
 
+def test_block_smooth_equivalence() -> None:
+    """4/8/16 block-S must preserve the dense Linear result."""
+
+    generator = torch.Generator().manual_seed(17)
+    x = torch.randn(23, 64, generator=generator)
+    w = torch.randn(31, 64, generator=generator)
+    d = torch.rand(64, generator=generator) * 2.0 + 0.25
+    permutation = torch.randperm(64, generator=generator)
+    reference = x.mm(w.t())
+    for block_size in (4, 8, 16):
+        for seed in (0, 3):
+            xt = s._linear_pair_transform(
+                x, d, permutation, block_size, seed, weight_side=False
+            )
+            wt = s._linear_pair_transform(
+                w, d, permutation, block_size, seed, weight_side=True
+            )
+            assert torch.allclose(
+                reference, xt.mm(wt.t()), rtol=2.0e-5, atol=2.0e-5
+            ), f"block-S 等价变换失败: block={block_size}, seed={seed}"
+    print("block-S 4/8/16 等价性          OK")
+
+
 def test_weight_and_activation() -> None:
     w_quant, w_scale = make_nvfp4(OUT_FEATURES, IN_FEATURES, 2)
     calib = [
@@ -105,7 +134,19 @@ def test_weight_and_activation() -> None:
 
     weight_hat = s._dequantize_hif4(result["weight_params"]).to(torch.float32)
     weight_dense = s._dequantize_nvfp4_float32(w_quant, w_scale)
-    err = rel_err(weight_dense, weight_hat)
+    weight_multiplier = (
+        state["smooth_inv"].reciprocal()
+        if state["smooth_inv"] is not None
+        else None
+    )
+    weight_ref = apply_state_transform(
+        weight_dense,
+        multiplier=weight_multiplier,
+        permutation=state["permutation"],
+        block_smooth_size=state.get("block_smooth_size", 0),
+        block_smooth_seed=state.get("block_smooth_seed", 0),
+    )
+    err = rel_err(weight_ref, weight_hat)
     assert err < MAX_REL_ERR, f"weight 重建误差过大: {err:.3f}"
     print(f"weight 校准+量化             OK  rel_err={err:.4f}")
 
@@ -120,6 +161,8 @@ def test_weight_and_activation() -> None:
         assert (a is None and b is None) or torch.equal(a, b), (
             f"activation_state[{key}] 结果不确定"
         )
+    for key in ("block_smooth_size", "block_smooth_seed"):
+        assert state.get(key, 0) == result2["activation_state"].get(key, 0)
     print("标定确定性                      OK")
 
     for i, (quant, scale) in enumerate(calib):
@@ -128,6 +171,8 @@ def test_weight_and_activation() -> None:
             s._dequantize_nvfp4_float32(quant, scale),
             multiplier=state["smooth_inv"],
             permutation=state["permutation"],
+            block_smooth_size=state.get("block_smooth_size", 0),
+            block_smooth_seed=state.get("block_smooth_seed", 0),
         )
         hat = s._dequantize_hif4(out).to(torch.float32)
         err = rel_err(ref, hat)
@@ -207,6 +252,7 @@ def test_attention() -> None:
 def main() -> int:
     try:
         test_dequantize_nvfp4()
+        test_block_smooth_equivalence()
         test_weight_and_activation()
         test_attention()
     except Exception as exc:  # noqa: BLE001

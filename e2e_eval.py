@@ -316,6 +316,7 @@ def set_config(name: str, real_normalize) -> None:
         s._WEIGHT_SMOOTH_ALPHAS = (0.25, 0.50)
         s._WEIGHT_SMOOTH_ALPHAS_WIDE = (0.25, 0.50, 0.75)
         s._WIDE_LAYER_MIN_DIM = 2048
+        s._BLOCK_SMOOTH_SIZES = ()
         s._WEIGHT_SMOOTH_RMS = False
         s._QK_SMOOTH_RMS = False
         s._REFINE_RANK_BY_ABSOLUTE = False
@@ -339,11 +340,13 @@ def set_config(name: str, real_normalize) -> None:
         s._WEIGHT_SMOOTH_ALPHAS = (0.25, 0.50, 0.75)
         s._WEIGHT_SMOOTH_ALPHAS_WIDE = (0.25, 0.375, 0.50, 0.625, 0.75)
         s._WIDE_LAYER_MIN_DIM = 2048
+        s._BLOCK_SMOOTH_SIZES = (4, 8, 16)
         s._WEIGHT_SMOOTH_RMS = True
         s._QK_SMOOTH_RMS = True
         s._REFINE_RANK_BY_ABSOLUTE = True
         s._REFINE_EDGE_EXTENSION = True
         s._DATA_DRIVEN_RATIO = True
+        s._RATIO_CAPTURE_TARGET = 0.999
         s._WEIGHT_QUADRATIC = True
         s._ACTIVATION_QUADRATIC = True
         s._PERMUTATION_BASES = True
