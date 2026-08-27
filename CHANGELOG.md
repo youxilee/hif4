@@ -1,5 +1,53 @@
 # 版本记录
 
+## v2.6 — X/W 联合残差补偿（Gauss-Seidel，6 算子 72/72 层全胜，线性均值 +0.055）
+
+### 问题
+
+v2.5 结论把 X/W 联合补偿判为低期望（`_diag_xbias` 的小 ceiling 估计：
+biasfrac 0.06–0.11、bias_m_act% 0.9–23.5%，暗示激活量化误差的确定性分量过小，
+静态 W 无从抵消）。该估计**是错的**：它只看了 ΔX 的逐通道一阶 bias，而联合补偿
+真正利用的是每个 64 维块位置上 XQ 与残差的高阶相关结构，直接最小化 score 度量
+m_h = ‖X·Wᵀ − Q(X)·Q(W)ᵀ‖²。标准 refine 只用 4 元素组 Gram 独立重建每个块；
+联合 refine 用完整 64×64 块 Gram + ΔX 交叉项，跨块共享 XQ 的量化偏差，把校准
+输出误差压到接近零。
+
+### 改动
+
+- 新增 `_joint_refine_weight_params`，在 `hif4_calibration_and_quantize_weight`
+  末尾对校准数据做联合 refine。块 b 候选 δ 的 ΔE = **+2a_bᵀδ + δᵀG_bδ**
+  （a_b = XQᵀ·res、G_b = XQᵀXQ 每块位置预计算，delta = wq_old − cand；
+  线性项符号为正因为实际变化是 −delta）。每行独立选 `_WEIGHT_OFFSETS` 5 档中
+  ΔE 最负且 <0 的候选；候选块用 `_solve_exact_hierarchy` 精确求解。
+- **Gauss-Seidel**：每块应用后增量更新残差（new_res = res + xq_b·deltaᵀ），
+  保证逐步单调。先做 Jacobi 全块齐改会过冲——大 offset 移动可达 4× scale，
+  块间耦合导致整体回归。
+- 关键实现细节：wq 的块切片是视图，**必须先捕获旧块算增量再写回**，否则
+  delta=0 → 退化回 Jacobi（曾致全评估回归 proj 0.51→−2.59）。
+- 收尾把 mant==0 的权重 sign 归零（checker 接受，值不变、分数中性）。
+- 门控常量 `_JOINT_REFINE_ENABLED / _JOINT_REFINE_ITER=3 / _JOINT_REFINE_MIN_TOKENS=8`。
+
+### 实测（amax6，GPT-2 12 层，calib=2 test=8）
+
+v2.6 自身边际增益（current 配置下 joint refine 开/关 A/B，逐算子逐层 72/72 全胜）：
+
+| 算子 | 关 | 开 | Δ |
+|---|---|---|---|
+| q | 0.6271 | 0.6670 | +0.0399 |
+| k | 0.6830 | 0.7246 | +0.0416 |
+| v | 0.5937 | 0.6315 | +0.0378 |
+| o | 0.5282 | 0.5939 | +0.0657 |
+| fc | 0.4871 | 0.5468 | +0.0597 |
+| proj | 0.5132 | 0.5976 | +0.0844 |
+
+线性均值 0.5721→0.6269（+0.0548），Attention 不变（0.4961）。--config both
+累计（对 v2.5）：q +18.0%、k +38.5%、v +7.4%、o +28.0%、fc +23.0%、
+proj +100.7%、Attn +19.6%。
+
+鲁棒性：换 calib 分裂（样本 4,5 而非 0,1）增益几乎不变（proj +0.998 vs
++1.013），确认跨序列可迁移（每通道激活量化偏差是系统性的）。运行时
+49.9s→64.7s（+15s，预算内）。`test_solution.py` 通过。
+
 ## v2.5 — Linear 候选评估接入最终量化器（仅 proj，proj +0.0080）
 
 ### 问题
@@ -54,9 +102,9 @@ H32/H64 先例吻合，可能是 attention 的剩余空间。
 
 ### 结论
 
-P2 余项（full block-S、X/W 联合补偿）期望值低：Attention 的等价块变换空间
-（d/perm/block/center）已挖完，Linear 的候选评估已对齐，剩余是过拟合风险
-大于增益的微调。v2.5 是当前稳定点。
+P2 两个余项结果相反：**full block-S 放弃**（等价块变换空间 d/perm/block/center
+已挖完，块矩阵拟合无剩余相关性可用），**X/W 联合补偿大胜**（v2.6，6 算子 72/72
+层全胜，见上）。v2.6 是当前稳定点。
 
 ## v2.4 — Attention 候选评估改最终量化器（attn +0.0109）
 
