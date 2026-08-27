@@ -50,6 +50,10 @@ _BLOCK_SMOOTH_SIZES = (4, 8, 16)
 # 实测 proj +0.0115；对 o/fc 放宽会轻微退化，故只给 proj）。
 _BLOCK_SMOOTH_PROJ_SIZES = (4, 8, 16, 32, 64)
 _BLOCK_SMOOTH_SEEDS = (0, 1, 2, 3)
+# 其余层只枚举 seed 0（v2.0 已验证的绝对索引图案）。旧公式 seed 0/1/2 完全
+# 退化、seed 3 近退化，等价于只有 seed 0；多样化 seed 仅 proj 使用，窄层
+# 细搜索会过拟合（v1.8 教训，8-batch 实测 fc -0.0037）。
+_BLOCK_SMOOTH_NARROW_SEEDS = (0,)
 # Evaluation-only override used by the sweep harness.  Zero keeps the guarded
 # production behavior; 4/8/16 forces that size while still choosing its best
 # deterministic sign seed on calibration data.
@@ -1090,6 +1094,40 @@ def _hadamard_matrix(
     return h * (1.0 / math.sqrt(float(n)))
 
 
+def _block_signs(
+    channels: int,
+    size: int,
+    seed: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Deterministic per-channel signs for the block-orthogonal transform.
+
+    seed 0 保留 v2.0 已验证的绝对通道索引图案（与块尺寸无关）；seed>0 用
+    独立 PRNG 生成每块恰好半正半负的随机置乱，与 (size, seed) 强相关。
+    修复旧公式 seed 0/1/2 完全退化、seed 3 仅差一个块的缺陷（当时整个
+    block-S 搜索实际只测了一个全局符号图案）。
+    """
+
+    blocks = channels // size
+    if int(seed) == 0:
+        indices = torch.arange(channels, dtype=torch.int64, device=device)
+        bits = (indices * 1_103_515_245 + 12_345).bitwise_and(1 << 30)
+        return torch.where(bits == 0, 1.0, -1.0).to(dtype=dtype)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(0x9E3779B97F4A7C15 + int(seed) * 2_654_435_761 + size)
+    # 每块一个均匀随机排列，前 size//2 个位置 +1，其余 -1 → 每块恰好半正半负，
+    # 保证每块都被真实打乱（不出现整块同号导致白做）。
+    rank = torch.rand(blocks, size, device=device, generator=generator).argsort(
+        dim=1
+    )
+    return torch.where(
+        rank < size // 2,
+        torch.tensor(1.0, dtype=dtype, device=device),
+        torch.tensor(-1.0, dtype=dtype, device=device),
+    )
+
+
 def _block_hadamard_transform(
     dense: torch.Tensor,
     block_size: int,
@@ -1097,10 +1135,11 @@ def _block_hadamard_transform(
 ) -> torch.Tensor:
     """Apply a deterministic signed orthogonal transform to feature blocks.
 
-    The signs avoid concentrating positively correlated channels in the DC
-    Hadamard coefficient.  They are derived from the absolute feature index,
-    so calibration and dynamic quantization only share ``block_size`` and a
-    small integer ``seed``.
+    The signs scramble channels within each block before the Hadamard, avoiding
+    concentrating positively correlated channels in the DC coefficient.  Signs
+    are rebuilt from ``(channels, block_size, seed)``, so calibration and
+    dynamic quantization only share ``block_size`` and a small integer
+    ``seed``.
     """
 
     size = int(block_size)
@@ -1111,11 +1150,7 @@ def _block_hadamard_transform(
         raise ValueError(
             f"Feature width {channels} is not divisible by block size {size}"
         )
-    indices = torch.arange(channels, dtype=torch.int64, device=dense.device)
-    bits = (
-        indices * 1_103_515_245 + int(seed) * 214_013 + 12_345
-    ).bitwise_and(1 << 30)
-    signs = torch.where(bits == 0, 1.0, -1.0).to(dtype=dense.dtype)
+    signs = _block_signs(channels, size, int(seed), dense.device, dense.dtype)
     grouped = dense.reshape(*dense.shape[:-1], channels // size, size)
     grouped = grouped * signs.reshape(channels // size, size)
     h = _hadamard_matrix(size, dense.device, dense.dtype)
@@ -1485,14 +1520,18 @@ def hif4_calibration_and_quantize_weight(
     force_block_size = int(_BLOCK_SMOOTH_FORCE_SIZE)
     if force_block_size:
         candidate_block_sizes = (force_block_size,)
+        candidate_seeds = _BLOCK_SMOOTH_SEEDS
     else:
-        # 下投影（out < in，即 GPT-2 的 proj）允许更大 block 族；其余层保持
-        # 4/8/16（v1.8 教训：窄层细搜索过拟合，block 同理）。proj 扩展只在
+        # 下投影（out < in，即 GPT-2 的 proj）允许更大 block 族 + 多样化 seed；
+        # 其余层保持 4/8/16 与 seed-0 图案（v1.8 教训：窄层细搜索过拟合，
+        # 8-batch 实测多样化 seed 在 fc -0.0037/o -0.0012）。proj 扩展只在
         # 基础 _BLOCK_SMOOTH_SIZES 非空时生效，否则继承 set_config 的禁用。
+        is_proj = out_features < in_features and bool(_BLOCK_SMOOTH_SIZES)
         candidate_block_sizes = (
-            _BLOCK_SMOOTH_PROJ_SIZES
-            if (out_features < in_features and _BLOCK_SMOOTH_SIZES)
-            else _BLOCK_SMOOTH_SIZES
+            _BLOCK_SMOOTH_PROJ_SIZES if is_proj else _BLOCK_SMOOTH_SIZES
+        )
+        candidate_seeds = (
+            _BLOCK_SMOOTH_SEEDS if is_proj else _BLOCK_SMOOTH_NARROW_SEEDS
         )
     forced_choice: Optional[tuple[tuple[float, tuple[float, ...]], int, int]] = None
     block_baseline_metrics = _linear_output_candidate_metrics(
@@ -1507,7 +1546,7 @@ def hif4_calibration_and_quantize_weight(
             size = int(candidate_size)
             if size <= 0 or in_features % size != 0:
                 continue
-            for candidate_seed in _BLOCK_SMOOTH_SEEDS:
+            for candidate_seed in candidate_seeds:
                 seed = int(candidate_seed)
                 block_metrics = _linear_output_candidate_metrics(
                     weight_sample,

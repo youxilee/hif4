@@ -1,5 +1,30 @@
 # 版本记录
 
+## v2.2 — 修复 block-S seed 退化 + proj 专属多样化 codebook（proj +0.0045）
+
+### 问题
+
+旧符号公式 `(idx * M + seed * C + 12345) & (1<<30)` 对 seed 几乎不敏感：
+实测 seed 0/1/2 的变换完全相同（0 元素差异），seed 3 只差 2 个符号。
+`_BLOCK_SMOOTH_SEEDS = (0,1,2,3)` 名义 4 个 seed，实际只有 1 个真候选——
+整个 block-S 搜索长期只在测"同一个全局符号翻转图案"。
+
+### 改动
+
+- `_block_signs`：seed 0 保留 v2.0 已验证的绝对通道索引图案；seed 1/2/3
+  改用独立 PRNG 按 `(size, seed)` 生成每块恰好半正半负的随机置乱，与
+  旧图案全部 3072 元素不同。
+- 多样化 seed 仅 proj（`out_features < in_features`）使用；其余层锁
+  `_BLOCK_SMOOTH_NARROW_SEEDS = (0,)`（即 v2.0 图案）。窄层套用多样化
+  seed 会过拟合：8-batch 实测 fc -0.0037、o -0.0012（与 v1.8 窄层细
+  搜索过拟合同一教训）。
+
+### 实测（amax6，GPT-2 12 层）
+
+8 批测试：proj 0.5007→0.5052（+0.0045，最差层 0.4154→0.4211），
+q/k/v/o/fc 全部 ±0.0004 内噪声，attn 不变。官方口径（2 批）：
+proj 0.4974→0.5013（+0.0039），其余逐项不变。`test_solution.py` 通过。
+
 ## v2.1 — proj 专属 H32/H64 block-S（proj +0.0152，其余逐项不变）
 
 ### 改动
