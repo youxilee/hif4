@@ -1,5 +1,31 @@
 # 版本记录
 
+## v2.4 — Attention 候选评估改最终量化器（attn +0.0109）
+
+### 问题
+
+v2.3 把候选评估从逐算子 proxy 换成了端到端输出损失，但用的还是标准 HiF4
+量化器；落地却用 offsets + 数据驱动 refine + 候选 importance 的精确量化器。
+目标仍不一致：候选按"标准量化器下的输出误差"排序，评分却按"精确量化器"
+算，可能选到 plain 好但 refine 受益少的候选。
+
+### 改动
+
+- `_attention_candidate_metrics` 重新按候选构造 Q/K importance（K/Q 二阶矩 ×
+  d²、按置换、块平均），并把量化换成与落地一致的路径：`search_offsets` +
+  refine（`error_threshold`/`accept_margin`/`max_refine_blocks` 同落地）。
+- refine 比例取 0.5 而非 1.0：只 refine 最难的半数块，判别力更好（全量 refine
+  把候选输出拉平、丢掉了"谁更受益于 refine"的信号）且省一半耗时。
+  8 批实测 0.4961（ratio 0.5）> 0.4954（ratio 1.0）。
+
+### 实测（amax6，GPT-2 12 层）
+
+8 批测试：attn 0.4852→0.4954（+0.0102，最差层 0.3009→0.3029），Linear 六项
+逐层分值与 v2.2/v2.3 完全一致。校准 +约 5s/12 层。`test_solution.py` 通过。
+
+> 同样的 objective mismatch 也存在于 Linear 候选评估（`_linear_output_candidate_metrics`
+> 仍用标准量化器），但 Linear 已高度优化、候选更多、成本更高，留作后续。
+
 ## v2.3 — Attention 候选改端到端输出损失 + Q/K 等价块变换（attn +0.0968）
 
 ### 问题

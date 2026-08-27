@@ -102,6 +102,14 @@ _ATTN_SMOOTH_MIN_IMPROVEMENT = 0.001
 _ATTN_SMOOTH_WORST_TOLERANCE = 0.01
 _ATTN_PERM_MIN_IMPROVEMENT = 0.001
 _ATTN_PERM_WORST_TOLERANCE = 0.005
+# v2.4：候选评估用"最终量化器"（offsets + refine + 候选 importance）而不是
+# 标准 HiF4，消除候选用标准量化器评、落地却用精确量化器的目标不一致。
+# refine 比例取 0.5 而非 1.0：只 refine 最难的半数块，反而比全量 refine 判别力
+# 更好（全量把候选输出拉平，丢掉了"哪些候选更受益于 refine"的信号），且省一半
+# 耗时；8 批实测 0.4961 vs 0.4954（ratio 1.0）。accept/block 上限与落地一致。
+_ATTN_CANDIDATE_REFINE_RATIO = 0.5
+_ATTN_CANDIDATE_ACCEPT_MARGIN = 0.03
+_ATTN_CANDIDATE_REFINE_BLOCKS = 24_576
 
 _SMOOTH_SCALE_MIN = 1.0 / 8.0
 _SMOOTH_SCALE_MAX = 8.0
@@ -1798,6 +1806,8 @@ def _attention_candidate_metrics(
     k_samples: Sequence[torch.Tensor],
     v_samples: Sequence[torch.Tensor],
     d_kv: torch.Tensor,
+    q_second_moment: torch.Tensor,
+    k_effective_second_moment: torch.Tensor,
     q_num_heads: int,
     kv_num_heads: int,
     head_dim: int,
@@ -1806,16 +1816,17 @@ def _attention_candidate_metrics(
     center_mode: int,
     block_smooth_size: int = 0,
     block_smooth_seed: int = 0,
+    use_final_quantizer: bool = True,
 ) -> tuple[float, tuple[float, ...]]:
     """End-to-end causal softmax output MSE for Q/K transform candidates.
 
-    v2.3 replaces the old per-operator Q/K reconstruction proxy, which mis-ranks
-    candidates that change the logits distribution (the v2.0 Linear lesson: a
-    local reconstruction proxy wrongly rejected strong non-diagonal candidates).
-    Candidates are now judged by the real ``softmax(AV)`` output error against
-    the exact reference, with V kept exact so the score isolates the Q/K
-    contribution.  Q and K share the same block-orthogonal (size, seed), which
-    preserves QK^T exactly before quantization.
+    v2.3 replaced the old per-operator Q/K reconstruction proxy with the real
+    ``softmax(AV)`` output error against the exact reference (V kept exact so the
+    score isolates the Q/K contribution).  v2.4 makes the ranking quantizer the
+    *final* deployed one (offsets + bounded refine + the candidate's own
+    importance), so candidate selection and the competition score no longer
+    disagree on which quantizer matters.  Q and K share the same block-orthogonal
+    (size, seed), which preserves QK^T exactly before quantization.
     """
 
     group_size = q_num_heads // kv_num_heads
@@ -1823,6 +1834,45 @@ def _attention_candidate_metrics(
     d_k = d_kv.reciprocal()
     q_order = q_permutation.to(dtype=torch.int64, device=d_kv.device).reshape(-1)
     k_order = k_permutation.to(dtype=torch.int64, device=d_kv.device).reshape(-1)
+
+    q_second_kv = q_second_moment.reshape(
+        kv_num_heads, group_size, head_dim
+    ).mean(dim=1)
+    h_k = k_effective_second_moment * d_k.square()
+    h_q = q_second_kv * d_kv.square()
+    h_k_for_q = _normalize_importance(
+        h_k.repeat_interleave(group_size, dim=0)
+        .reshape(-1)
+        .index_select(0, q_order),
+        q_num_heads * head_dim,
+    )
+    h_q_for_k = _normalize_importance(
+        h_q.reshape(-1).index_select(0, k_order),
+        kv_num_heads * head_dim,
+    )
+    if h_k_for_q is None:
+        h_k_for_q = torch.ones(q_num_heads * head_dim, dtype=torch.float32)
+    if h_q_for_k is None:
+        h_q_for_k = torch.ones(kv_num_heads * head_dim, dtype=torch.float32)
+    if block_smooth_size:
+        h_k_for_q = _block_average(h_k_for_q, block_smooth_size)
+        h_q_for_k = _block_average(h_q_for_k, block_smooth_size)
+
+    def quantize(
+        dense: torch.Tensor,
+        importance: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if not use_final_quantizer:
+            return _dense_to_hif4(dense)
+        return _dense_to_hif4(
+            dense,
+            importance=importance,
+            search_offsets=_DYNAMIC_OFFSETS,
+            error_threshold=_ATTN_REFINE_ERROR_THRESHOLD,
+            accept_margin=_ATTN_CANDIDATE_ACCEPT_MARGIN,
+            max_refine_ratio=_ATTN_CANDIDATE_REFINE_RATIO,
+            max_refine_blocks=_ATTN_CANDIDATE_REFINE_BLOCKS,
+        )
 
     ref_outputs = [
         _causal_attention_output(qs, ks, vs, q_num_heads, kv_num_heads, head_dim)
@@ -1846,8 +1896,8 @@ def _attention_candidate_metrics(
             block_smooth_size,
             block_smooth_seed,
         )
-        q_hat = _dequantize_hif4(_dense_to_hif4(q_smooth))
-        k_hat = _dequantize_hif4(_dense_to_hif4(k_smooth))
+        q_hat = _dequantize_hif4(quantize(q_smooth, h_k_for_q))
+        k_hat = _dequantize_hif4(quantize(k_smooth, h_q_for_k))
         out_h = _causal_attention_output(
             q_hat, k_hat, v_sample, q_num_heads, kv_num_heads, head_dim
         )
@@ -1988,6 +2038,8 @@ def hif4_calibration_attention(
         k_samples,
         v_samples,
         identity_d,
+        q_second_moment,
+        k_second_moment,
         q_num_heads,
         kv_num_heads,
         head_dim,
@@ -2034,6 +2086,8 @@ def hif4_calibration_attention(
                 k_samples,
                 v_samples,
                 candidate_d,
+                q_second_moment,
+                effective_second,
                 q_num_heads,
                 kv_num_heads,
                 head_dim,
@@ -2074,6 +2128,8 @@ def hif4_calibration_attention(
             k_samples,
             v_samples,
             best_d,
+            q_second_moment,
+            selected_k_second,
             q_num_heads,
             kv_num_heads,
             head_dim,
@@ -2117,6 +2173,8 @@ def hif4_calibration_attention(
                 k_samples,
                 v_samples,
                 best_d,
+                q_second_moment,
+                selected_k_second,
                 q_num_heads,
                 kv_num_heads,
                 head_dim,
@@ -2151,6 +2209,8 @@ def hif4_calibration_attention(
                     k_samples,
                     v_samples,
                     best_d,
+                    q_second_moment,
+                    selected_k_second,
                     q_num_heads,
                     kv_num_heads,
                     head_dim,
