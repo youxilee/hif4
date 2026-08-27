@@ -166,7 +166,7 @@ _DATA_DRIVEN_RATIO = True
 # 时间预算允许放宽后，把损失覆盖目标从 0.99 提到 0.999：实际 refine
 # 比例从 ~0.95 提到 ~0.99（几乎全量），8 批测试上 7 类得分全部为正
 # （attn +0.0018，其余 +0.0001~0.0003），动态耗时 +约 5%。
-_RATIO_CAPTURE_TARGET = 0.999
+_RATIO_CAPTURE_TARGET = 0.99
 _RATIO_MIN = 0.10
 
 # Weight quantization can use the full per-block activation covariance as a
@@ -187,24 +187,6 @@ _ACTIVATION_QUADRATIC = True
 # node limit.  Wide layers (e.g. FFN down-projection, 3072) fall back to the
 # diagonal importance automatically.
 _ACTIVATION_QUADRATIC_MAX_FEATURES = 1024
-
-# Permutation search bases.  The initial hierarchy-aware ordering combines the
-# paired operands via max(log range); real-data diagnostics show the operand
-# with the larger quantization burden (usually the weight/K side) often yields
-# a better single-sided ordering.  Each basis is evaluated with the exact
-# paired metric and accepted only when it clears the same safety gate as the
-# smoothing candidates.
-_PERMUTATION_BASES = True
-
-# V 量化目前没有任何重要性：V 的误差进入 softmax 输出时被注意力权重
-# 放大，而校准期可以静态估计每 KV head 的平均平方注意力质量
-# E[A^2]（softmax 概率，因果掩码下按 token 位置平均）。head_dim=64 时
-# 一个 HiF4 64 块恰好是一个 head 的一条位置切片，按 head 加权可以直接
-# 作用到块上。与 Q/K 协方差不同，这是静态概率统计，不会过拟合少量 token。
-_V_ATTENTION_IMPORTANCE = True
-# 向均匀权重收缩的比例（0.0 = 均匀，1.0 = 完全按 E[A^2] 加权），
-# 实测完全加权最优（attn +0.0010），收缩反而稀释收益。
-_V_ATTENTION_IMPORTANCE_SHRINK = 1.0
 
 
 def dequantize_nvfp4(
@@ -398,30 +380,6 @@ def _hierarchy_aware_permutation(
     return torch.argsort(pressure, descending=True)
 
 
-def _range_permutation(ranges: torch.Tensor) -> torch.Tensor:
-    """1D argsort of log ranges; identity when the log spread is negligible."""
-
-    log_r = torch.log2(ranges.to(torch.float32).clamp_min(_EPS))
-    log_r = log_r - torch.median(log_r)
-    flat = log_r.reshape(-1)
-    if float(flat.max() - flat.min()) < 0.25:
-        return _identity_permutation(int(flat.numel()), flat.device)
-    return torch.argsort(flat, descending=True)
-
-
-def _headwise_range_permutation(ranges: torch.Tensor) -> torch.Tensor:
-    """Per-head argsort of log ranges (ranges: [heads, head_dim])."""
-
-    log_r = torch.log2(ranges.to(torch.float32).clamp_min(_EPS))
-    log_r = log_r - log_r.median(dim=-1, keepdim=True).values
-    spread = log_r.amax(dim=-1) - log_r.amin(dim=-1)
-    identity = torch.arange(
-        int(ranges.shape[-1]), dtype=torch.int64, device=ranges.device
-    ).expand_as(ranges)
-    ordered = torch.argsort(log_r, dim=-1, descending=True)
-    return torch.where(spread[:, None] >= 0.25, ordered, identity)
-
-
 def _headwise_hierarchy_permutation(
     q_range: torch.Tensor,
     k_range: torch.Tensor,
@@ -497,33 +455,6 @@ def _center_attention_k(
     else:
         raise ValueError("Unsupported attention center mode")
     return (grouped - center).reshape_as(dense)
-
-
-def _attention_head_square_mass(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    q_num_heads: int,
-    kv_num_heads: int,
-    head_dim: int,
-) -> torch.Tensor:
-    """每个 KV head 的平均平方注意力质量 E[A^2]（因果 softmax）。
-
-    V 输出误差被 A 加权，输出 MSE 中 V 通道的静态权重近似为
-    ``E_t,s[A(t,s,h)^2]``。GQA 下每个 KV head 对应 group 个 Q head，
-    取组内平均。返回 ``[kv_num_heads]``。
-    """
-
-    seq = int(q.shape[0])
-    group = q_num_heads // kv_num_heads
-    qh = q.reshape(seq, q_num_heads, head_dim)
-    kh = k.reshape(seq, kv_num_heads, head_dim).repeat_interleave(group, dim=1)
-    scores = torch.einsum("thd,shd->tsh", qh, kh) / math.sqrt(float(head_dim))
-    mask = torch.triu(
-        torch.full((seq, seq), float("-inf"), device=scores.device), 1
-    ).unsqueeze(-1)
-    probs = torch.softmax(scores + mask, dim=1)
-    per_q_head = probs.square().mean(dim=(0, 1))
-    return per_q_head.reshape(kv_num_heads, group).mean(dim=1)
 
 
 def _e6m2_encode_nearest(value: torch.Tensor) -> torch.Tensor:
@@ -1572,42 +1503,6 @@ def hif4_calibration_and_quantize_weight(
                 best_d = candidate_d
                 best_perm = candidate_perm
 
-    # 置换基扩展：同一平滑 d 下比较 weight-only / activation-only 排序，
-    # 诊断显示单侧排序常优于 max(log range) 组合排序。
-    if _PERMUTATION_BASES:
-        basis_ranges = {
-            "w_amax": weight_amax * best_d,
-            "x_amax": activation_amax / best_d,
-            "w_rms": weight_rms * best_d,
-            "x_rms": activation_rms / best_d,
-        }
-        seen = {tuple(best_perm.tolist())}
-        for bname, b_range in basis_ranges.items():
-            b_perm = _range_permutation(b_range)
-            if torch.equal(b_perm, identity_perm):
-                continue
-            if tuple(b_perm.tolist()) in seen:
-                continue
-            seen.add(tuple(b_perm.tolist()))
-            b_metrics = _linear_candidate_metrics(
-                weight_sample,
-                activation_second_moment,
-                activation_samples,
-                best_d,
-                b_perm,
-            )
-            if (
-                b_metrics[0] < best_metrics[0]
-                and _candidate_is_safe(
-                    b_metrics,
-                    baseline_metrics,
-                    min_mean_improvement=0.02,
-                    worst_tolerance=0.005,
-                )
-            ):
-                best_metrics = b_metrics
-                best_perm = b_perm
-
     # Matrix SmoothQuant extension: within the channel groups selected above,
     # try non-diagonal block transforms of size 4/8/16.  The transform is a
     # deterministic signed Hadamard, hence exactly orthogonal and represented
@@ -2148,7 +2043,6 @@ def hif4_calibration_attention(
     q_token_count = 0
     k_token_count = 0
     sample_count = 0
-    v_head_mass = torch.zeros(kv_num_heads, dtype=torch.float32)
     q_samples: list[torch.Tensor] = []
     k_samples: list[torch.Tensor] = []
     v_samples: list[torch.Tensor] = []
@@ -2175,11 +2069,6 @@ def hif4_calibration_attention(
         if int(q.shape[0]) != int(k.shape[0]) or int(k.shape[0]) != int(v_quant.shape[0]):
             raise ValueError("Q/K/V in a calibration sample must share seq_len")
 
-        if _V_ATTENTION_IMPORTANCE:
-            v_head_mass += _attention_head_square_mass(
-                q, k, q_num_heads, kv_num_heads, head_dim
-            )
-
         q_stats = _sample_rows(q, _ATTN_STATS_TOKENS).reshape(
             -1, q_num_heads, head_dim
         )
@@ -2205,21 +2094,6 @@ def hif4_calibration_attention(
         k_samples.append(_sample_rows(k, _ATTN_EVAL_TOKENS).clone())
         v_dense = _dequantize_nvfp4_float32(v_quant, v_scale)
         v_samples.append(_sample_rows(v_dense, _ATTN_EVAL_TOKENS).clone())
-
-    v_importance = None
-    if _V_ATTENTION_IMPORTANCE and sample_count > 0:
-        head_importance = v_head_mass / float(max(sample_count, 1))
-        head_importance = head_importance / head_importance.mean().clamp_min(
-            _EPS
-        )
-        if _V_ATTENTION_IMPORTANCE_SHRINK < 1.0:
-            head_importance = 1.0 + _V_ATTENTION_IMPORTANCE_SHRINK * (
-                head_importance - 1.0
-            )
-        v_importance = _normalize_importance(
-            head_importance.repeat_interleave(head_dim).reshape(-1),
-            kv_channels,
-        )
 
     q_second_moment = q_sum_square / float(max(q_token_count, 1))
     k_second_moment = k_sum_square / float(max(k_token_count, 1))
@@ -2361,51 +2235,6 @@ def hif4_calibration_attention(
             best_q_perm = candidate_q_perm
             best_k_perm = candidate_k_perm
 
-    # 置换基扩展：单侧排序（Q-only / K-only）常优于 max(log range) 组合。
-    if _PERMUTATION_BASES:
-        basis_ranges = {
-            "q_amax": q_peak_kv * best_d,
-            "k_amax": selected_k_peak * best_d.reciprocal(),
-        }
-        seen = {tuple(best_k_perm.tolist())}
-        for bname, b_range in basis_ranges.items():
-            b_local = _headwise_range_permutation(b_range)
-            b_k_perm = _flatten_head_permutation(b_local)
-            if torch.equal(b_k_perm, k_identity_perm):
-                continue
-            if tuple(b_k_perm.tolist()) in seen:
-                continue
-            seen.add(tuple(b_k_perm.tolist()))
-            b_q_perm = _flatten_head_permutation(
-                b_local.repeat_interleave(group_size, dim=0)
-            )
-            b_metrics = _attention_candidate_metrics(
-                q_samples,
-                k_samples,
-                v_samples,
-                best_d,
-                q_second_moment,
-                selected_k_second,
-                q_num_heads,
-                kv_num_heads,
-                head_dim,
-                b_q_perm,
-                b_k_perm,
-                best_center_mode,
-            )
-            if (
-                b_metrics[0] < best_metrics[0]
-                and _candidate_is_safe(
-                    b_metrics,
-                    baseline_metrics,
-                    min_mean_improvement=_ATTN_PERM_MIN_IMPROVEMENT,
-                    worst_tolerance=_ATTN_PERM_WORST_TOLERANCE,
-                )
-            ):
-                best_metrics = b_metrics
-                best_q_perm = b_q_perm
-                best_k_perm = b_k_perm
-
     # 等价块正交变换：Q/K 共享同一 (size, seed)，QK^T 在量化前严格不变，
     # 只在已选定的 d/置换之上枚举块大小×符号 seed，用端到端输出损失门控。
     best_block_size = 0
@@ -2509,7 +2338,7 @@ def hif4_calibration_attention(
         )
         v_ratio = _loss_capture_ratio(
             torch.cat(
-                [_standard_block_losses(s, v_importance) for s in v_samples]
+                [_standard_block_losses(s, None) for s in v_samples]
             ),
             target=_RATIO_CAPTURE_TARGET,
             ratio_min=_RATIO_MIN,
@@ -2567,11 +2396,7 @@ def hif4_calibration_attention(
     }
     v_state = {
         "offsets": torch.tensor(_DYNAMIC_OFFSETS, dtype=torch.int8, device="cpu"),
-        "importance": (
-            None
-            if v_importance is None
-            else _cpu_state_tensor(v_importance)
-        ),
+        "importance": None,
         "error_threshold": _ATTN_REFINE_ERROR_THRESHOLD,
         "accept_margin": _V_REFINE_ACCEPT_MARGIN,
         "max_refine_ratio": float(v_ratio),
