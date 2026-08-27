@@ -43,8 +43,12 @@ _WIDE_LAYER_MIN_DIM = 2048
 # usual X @ W convention this is a block-diagonal S on X and S^{-1} on W;
 # orthogonality makes S^{-1}=S^T, so the row-major weight carrier can use the
 # same right transform.  Only the winning block size enters dynamic state.
-_BLOCK_SMOOTH_ALLOWED_SIZES = (4, 8, 16)
-_BLOCK_SMOOTH_SIZES = _BLOCK_SMOOTH_ALLOWED_SIZES
+_BLOCK_SMOOTH_ALLOWED_SIZES = (4, 8, 16, 32, 64)
+_BLOCK_SMOOTH_SIZES = (4, 8, 16)
+# 下投影层（proj，out_features < in_features）额外允许更大 block：
+# 输入通道多、块内相关性更强，32/64 能更充分摊平重尾（GPT-2 即 FFN 下投影 3072→768，
+# 实测 proj +0.0115；对 o/fc 放宽会轻微退化，故只给 proj）。
+_BLOCK_SMOOTH_PROJ_SIZES = (4, 8, 16, 32, 64)
 _BLOCK_SMOOTH_SEEDS = (0, 1, 2, 3)
 # Evaluation-only override used by the sweep harness.  Zero keeps the guarded
 # production behavior; 4/8/16 forces that size while still choosing its best
@@ -1479,9 +1483,17 @@ def hif4_calibration_and_quantize_weight(
     # deterministic signed Hadamard, hence exactly orthogonal and represented
     # in dynamic state by two small integers rather than a dense matrix.
     force_block_size = int(_BLOCK_SMOOTH_FORCE_SIZE)
-    candidate_block_sizes = (
-        (force_block_size,) if force_block_size else _BLOCK_SMOOTH_SIZES
-    )
+    if force_block_size:
+        candidate_block_sizes = (force_block_size,)
+    else:
+        # 下投影（out < in，即 GPT-2 的 proj）允许更大 block 族；其余层保持
+        # 4/8/16（v1.8 教训：窄层细搜索过拟合，block 同理）。proj 扩展只在
+        # 基础 _BLOCK_SMOOTH_SIZES 非空时生效，否则继承 set_config 的禁用。
+        candidate_block_sizes = (
+            _BLOCK_SMOOTH_PROJ_SIZES
+            if (out_features < in_features and _BLOCK_SMOOTH_SIZES)
+            else _BLOCK_SMOOTH_SIZES
+        )
     forced_choice: Optional[tuple[tuple[float, tuple[float, ...]], int, int]] = None
     block_baseline_metrics = _linear_output_candidate_metrics(
         weight_sample,

@@ -1,5 +1,20 @@
 # 版本记录
 
+## v2.1 — proj 专属 H32/H64 block-S（proj +0.0152，其余逐项不变）
+
+### 改动
+
+`_BLOCK_SMOOTH_ALLOWED_SIZES` 扩到 (4, 8, 16, 32, 64)，新增
+`_BLOCK_SMOOTH_PROJ_SIZES`。下投影层（`out_features < in_features`，
+GPT-2 即 FFN 下投影 3072→768）的 block-S 候选扩展到 32/64，其余层保持
+4/8/16。规则形状自含（harness 无需传算子名）；`set_config("original")`
+的禁用语义通过 `_BLOCK_SMOOTH_SIZES` 非空守卫继承，不污染 original 基线。
+
+### 实测（amax6，GPT-2 12 层，2 calib + 2 test）
+
+proj 0.4822 → 0.4974（+0.0152，最差层 0.3959 → 0.4123）；q/k/v/o/fc/attn
+逐项不变。与 tsx 架构评审的 2-batch 数据完全一致。`test_solution.py` 通过。
+
 ## v2.0 — Block-diagonal Matrix SmoothQuant（Linear 全面提升）
 
 ### 数学与实现
