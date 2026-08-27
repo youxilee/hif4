@@ -66,6 +66,12 @@ _WEIGHT_REFINE_MAX_RATIO_SMALL = 1.0
 _WEIGHT_REFINE_MAX_RATIO_LARGE = 1.0
 _WEIGHT_REFINE_MAX_BLOCKS = 65_536
 
+# 候选评估与落地量化器对齐（v2.5）：Linear block-S 搜索用 offsets + importance +
+# refine 后的端到端输出打分，消除“候选用标准 HiF4、落地用精确 refine”的目标偏差。
+# ratio 0.5 保留候选判别力（v2.4 Attention 经验：full refine 会抹平差异）且成本减半。
+_LINEAR_CANDIDATE_REFINE_RATIO = 0.5
+_LINEAR_CANDIDATE_REFINE_BLOCKS = 8_192
+
 _ACTIVATION_REFINE_ERROR_THRESHOLD = 1.0e-7
 _ACTIVATION_REFINE_ACCEPT_MARGIN = 0.02
 _ACTIVATION_REFINE_MAX_RATIO = 0.70
@@ -1332,6 +1338,8 @@ def _linear_output_candidate_metrics(
     permutation: torch.Tensor,
     block_smooth_size: int = 0,
     block_smooth_seed: int = 0,
+    activation_second_moment: Optional[torch.Tensor] = None,
+    use_final_quantizer: bool = False,
 ) -> tuple[float, tuple[float, ...]]:
     """Score a transform by the actual sampled Linear output error.
 
@@ -1339,8 +1347,15 @@ def _linear_output_candidate_metrics(
     smoothing, but it misses cancellation between activation and weight errors
     after a non-diagonal transform.  Block-S candidates therefore use the
     end-to-end sampled objective that the competition ultimately measures.
+
+    Deployment refines both operands with offsets + importance + refine, so
+    ranking candidates with the plain HiF4 quantizer is an objective mismatch.
+    When use_final_quantizer is set, weight candidates use _WEIGHT_OFFSETS with
+    activation-second-moment importance and activation candidates use
+    _DYNAMIC_OFFSETS with weight-gram importance, mirroring deployment (v2.5).
     """
 
+    channels = int(weight.shape[1])
     order = permutation.to(device=weight.device, dtype=torch.int64).reshape(-1)
     weight_transformed = _linear_pair_transform(
         weight,
@@ -1350,7 +1365,30 @@ def _linear_output_candidate_metrics(
         block_smooth_seed,
         weight_side=True,
     )
-    weight_hat = _dequantize_hif4(_dense_to_hif4(weight_transformed))
+    if use_final_quantizer:
+        h_x = _normalize_importance(
+            _transformed_second_moment(
+                activation_second_moment, d, order, block_smooth_size
+            ),
+            channels,
+        )
+        weight_params = _dense_to_hif4(
+            weight_transformed,
+            importance=h_x,
+            search_offsets=_WEIGHT_OFFSETS,
+            error_threshold=_WEIGHT_REFINE_ERROR_THRESHOLD,
+            accept_margin=_WEIGHT_REFINE_ACCEPT_MARGIN,
+            max_refine_ratio=_LINEAR_CANDIDATE_REFINE_RATIO,
+            max_refine_blocks=_LINEAR_CANDIDATE_REFINE_BLOCKS,
+        )
+    else:
+        weight_params = _dense_to_hif4(weight_transformed)
+    weight_hat = _dequantize_hif4(weight_params)
+
+    h_w = _normalize_importance(weight_hat.square().sum(dim=0), channels)
+    if h_w is None:
+        h_w = torch.ones(channels, dtype=torch.float32, device=weight.device)
+
     case_scores: list[float] = []
     for sample in activation_samples:
         activation_transformed = _linear_pair_transform(
@@ -1361,9 +1399,19 @@ def _linear_output_candidate_metrics(
             block_smooth_seed,
             weight_side=False,
         )
-        activation_hat = _dequantize_hif4(
-            _dense_to_hif4(activation_transformed)
-        )
+        if use_final_quantizer:
+            activation_params = _dense_to_hif4(
+                activation_transformed,
+                importance=h_w,
+                search_offsets=_DYNAMIC_OFFSETS,
+                error_threshold=_ACTIVATION_REFINE_ERROR_THRESHOLD,
+                accept_margin=_ACTIVATION_REFINE_ACCEPT_MARGIN,
+                max_refine_ratio=_LINEAR_CANDIDATE_REFINE_RATIO,
+                max_refine_blocks=_LINEAR_CANDIDATE_REFINE_BLOCKS,
+            )
+        else:
+            activation_params = _dense_to_hif4(activation_transformed)
+        activation_hat = _dequantize_hif4(activation_params)
         reference = activation_transformed.mm(weight_transformed.t())
         reconstructed = activation_hat.mm(weight_hat.t())
         score = (reference - reconstructed).square().sum() / (
@@ -1571,12 +1619,21 @@ def hif4_calibration_and_quantize_weight(
         candidate_seeds = (
             _BLOCK_SMOOTH_SEEDS if is_proj else _BLOCK_SMOOTH_NARROW_SEEDS
         )
+    # v2.5 逐算子诊断：refine 落地量化器排序在 proj（GELU 后激活、结构稀疏）
+    # 显著更好（8-batch 12 层中 7 层胜，净 +0.0080），在 fc（LN 后激活、平滑）
+    # 却更差（净 -0.0071，且会把 fc 误判回 identity）。因此只在 down-projection
+    # 上启用最终量化器排序，其余算子保持标准量化器。
+    use_refined_block_ranking = out_features < in_features and bool(
+        _BLOCK_SMOOTH_SIZES
+    )
     forced_choice: Optional[tuple[tuple[float, tuple[float, ...]], int, int]] = None
     block_baseline_metrics = _linear_output_candidate_metrics(
         weight_sample,
         activation_samples,
         best_d,
         best_perm,
+        activation_second_moment=activation_second_moment,
+        use_final_quantizer=use_refined_block_ranking,
     )
     block_best_metrics = block_baseline_metrics
     if candidate_block_sizes:
@@ -1593,6 +1650,8 @@ def hif4_calibration_and_quantize_weight(
                     best_perm,
                     size,
                     seed,
+                    activation_second_moment=activation_second_moment,
+                    use_final_quantizer=use_refined_block_ranking,
                 )
                 if force_block_size:
                     if (

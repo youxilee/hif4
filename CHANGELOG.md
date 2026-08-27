@@ -1,5 +1,32 @@
 # 版本记录
 
+## v2.5 — Linear 候选评估接入最终量化器（仅 proj，proj +0.0080）
+
+### 问题
+
+v2.4 已指出 `_linear_output_candidate_metrics` 的 objective mismatch：block-S
+候选按标准 HiF4 打分，落地却用 offsets + refine + importance。逐算子诊断证实
+mismatch 真实存在：refine 排序在 proj 上与 plain 显著分歧（如 L6 proj plain 选
+8/2、refine 选 16/1），且**方向按算子分布分裂**——proj（GELU 后激活、结构稀疏）
+refine 排序 8-batch 12 层中 7 层胜，净 +0.0080；fc（LN 后激活、平滑）净 −0.0071，
+且把 fc 误判回 identity 的层损失最大（L2 −0.036/L6 −0.027/L10 −0.016）。
+
+### 改动
+
+- `_linear_output_candidate_metrics` 增加 `activation_second_moment` /
+  `use_final_quantizer` 参数：启用时 weight 用 `_WEIGHT_OFFSETS` + 激活二阶矩
+  importance，activation 用 `_DYNAMIC_OFFSETS` + 权重 Gram importance，refine
+  ratio 0.5（v2.4 判别力结论），与落地路径对齐。
+- 门控 `use_refined_block_ranking = out_features < in_features`（即 proj）：
+  只对 down-projection 启用最终量化器排序。诊断显示 fc/o 等其余算子在 refine
+  排序下回归（fc 尤甚），保持标准量化器不动。
+
+### 实测（amax6，GPT-2 12 层）
+
+8 批测试：仅 proj 0.5052→0.5132（+0.0080），q/k/v/o/fc/attn 六项逐层分值与
+v2.4 完全一致（已对 clean v2.4 做 stash A/B 验证）。校准 +约 10s/12 层
+（proj 的 H32/H64 × 4 seed 候选族是唯一 refine 开销）。`test_solution.py` 通过。
+
 ## v2.4 — Attention 候选评估改最终量化器（attn +0.0109）
 
 ### 问题
