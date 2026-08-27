@@ -122,6 +122,28 @@ def test_block_smooth_equivalence() -> None:
     print("block-S 4/8/16 等价性          OK")
 
 
+def test_attention_block_equivalence() -> None:
+    """同一 block-S 同时作用于 Q/K 必须保持 causal softmax 输出（MHA 严格等价）。"""
+
+    generator = torch.Generator().manual_seed(19)
+    seq = 64
+    q = torch.randn(seq, Q_CHANNELS, generator=generator)
+    k = torch.randn(seq, Q_CHANNELS, generator=generator)
+    v = torch.randn(seq, Q_CHANNELS, generator=generator)
+    ref = s._causal_attention_output(q, k, v, Q_HEADS, Q_HEADS, HEAD_DIM)
+    for block_size in (4, 8, 16):
+        for seed in (0, 1, 2, 3):
+            q_s = s._block_hadamard_transform(q, block_size, seed)
+            k_s = s._block_hadamard_transform(k, block_size, seed)
+            out = s._causal_attention_output(
+                q_s, k_s, v, Q_HEADS, Q_HEADS, HEAD_DIM
+            )
+            assert torch.allclose(
+                ref, out, rtol=2.0e-5, atol=2.0e-5
+            ), f"attention block-S 等价性失败: block={block_size}, seed={seed}"
+    print("attention block-S 4/8/16 等价性 OK")
+
+
 def test_weight_and_activation() -> None:
     w_quant, w_scale = make_nvfp4(OUT_FEATURES, IN_FEATURES, 2)
     calib = [
@@ -211,6 +233,8 @@ def test_attention() -> None:
         s._dequantize_nvfp4_float32(q, qs),
         multiplier=q_state["multiplier"],
         permutation=q_state["permutation"],
+        block_smooth_size=q_state.get("block_smooth_size", 0),
+        block_smooth_seed=q_state.get("block_smooth_seed", 0),
     )
     err = rel_err(ref, s._dequantize_hif4(out).to(torch.float32))
     assert err < MAX_REL_ERR, f"Q 重建误差过大: {err:.3f}"
@@ -225,6 +249,8 @@ def test_attention() -> None:
         center_mode=int(k_state["center_mode"]),
         heads=KV_HEADS,
         head_dim=HEAD_DIM,
+        block_smooth_size=k_state.get("block_smooth_size", 0),
+        block_smooth_seed=k_state.get("block_smooth_seed", 0),
     )
     err = rel_err(ref, s._dequantize_hif4(out).to(torch.float32))
     assert err < MAX_REL_ERR, f"K 重建误差过大: {err:.3f}"
@@ -253,6 +279,7 @@ def main() -> int:
     try:
         test_dequantize_nvfp4()
         test_block_smooth_equivalence()
+        test_attention_block_equivalence()
         test_weight_and_activation()
         test_attention()
     except Exception as exc:  # noqa: BLE001

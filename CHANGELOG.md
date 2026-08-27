@@ -1,5 +1,37 @@
 # 版本记录
 
+## v2.3 — Attention 候选改端到端输出损失 + Q/K 等价块变换（attn +0.0968）
+
+### 问题
+
+Attention 的候选评估一直用 Q/K 逐算子重建 proxy（加权 Q/K 重建误差），
+从未直接优化 softmax 输出。Linear 在 v2.0 已证明这种局部 proxy 会错拒强
+候选；消融实测 Attention 的 proxy 更严重——仅把候选评估换成真实输出损失、
+保持同一候选族（d/置换）不动，attn 就从 0.3786 跳到 0.4416（+0.063）。
+
+### 改动
+
+- `_attention_candidate_metrics`：从重建 proxy 改为端到端 causal softmax
+  输出 MSE。候选与参考都跑 `_causal_attention_output`（与评测 harness 的
+  `causal_attn` 逐算子一致，standalone 内置在 solution.py）；V 保持精确以
+  隔离 Q/K 贡献。门控阈值按 m_h 相对下降重标定（score +0.001 ≈ 0.16%）。
+- 新增 `_ATTN_BLOCK_SMOOTH_SIZES/SEEDS`：在每个 head 内对 Q/K 施加同一
+  块正交变换（Q′=QS、K′=KS⁻ᵀ，S 正交 → S⁻ᵀ=S，MHA 下 QKᵀ 在量化前
+  严格不变），块大小 4/8/16 × seed 0/1/2/3，用端到端输出损失门控。动态
+  量化路径（`hif4_dynamic_quantize_q/k`）经 state 传递 block_smooth。
+- 选中的块变换下，refine 重要性按块均值摊平（能量在块内摊平后逐通道
+  权重不再准确）。
+
+### 实测（amax6，GPT-2 12 层）
+
+8 批测试：attn 0.3884→0.4852（+0.0968，最差层 0.2200→0.3009，
+最好 0.5183→0.6159）；Linear 六项逐层分值与 v2.2 完全一致。2 批消融：
+仅端到端度量 +0.063，块变换再 +0.040，center_mode 2 净零（无害保留）。
+`test_solution.py` 通过（含新增的 attention block-S 等价性测试）。
+
+> 注：块变换的严格等价性依赖 MHA（Q/K 等宽，绝对索引符号对齐）；GQA
+> 烟测下 Q/K 宽度不同，等价性不精确，但候选评估始终用真实输出，选择仍诚实。
+
 ## v2.2 — 修复 block-S seed 退化 + proj 专属多样化 codebook（proj +0.0045）
 
 ### 问题
